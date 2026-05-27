@@ -6,10 +6,8 @@
      ╚████╔╝ ╚██████╔╝██║██████╔╝    ███████║██║     ██║  ██║██║ ╚═╝ ██║
       ╚═══╝   ╚═════╝ ╚═╝╚═════╝     ╚══════╝╚═╝     ╚═╝  ╚═╝╚═╝     ╚═╝
 
-    VOID SPAM  —  Roblox Rivals HvH
-    Free. No key. No bullshit.
-    Ping-compensated slingshot bypass included.
-    Mobile + PC.
+    VOID SPAM  +  AIM ASSIST  +  DESYNC  —  Roblox Rivals HvH
+    Free. No key. Mobile + PC.
 ]]
 
 -- ─────────────────────────────────────────────────────────────
@@ -19,26 +17,24 @@ local Players          = game:GetService("Players")
 local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService     = game:GetService("TweenService")
+local ReplicatedStorage= game:GetService("ReplicatedStorage")
 local Stats            = game:GetService("Stats")
 
 local LP  = Players.LocalPlayer
 local Cam = workspace.CurrentCamera
 
 -- ─────────────────────────────────────────────────────────────
---  PING UTILITY
---  Rivals is ping-based for slingshot hit reg.
---  We read real network ping and scale our bypass timings.
+--  PING
 -- ─────────────────────────────────────────────────────────────
 local function getPing()
-    -- Stats.Network is the most accurate client-side ping source
-    local ok, ping = pcall(function()
+    local ok, p = pcall(function()
         return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
     end)
-    return ok and ping or 80  -- fallback 80ms if unavailable
+    return ok and p or 80
 end
 
 -- ─────────────────────────────────────────────────────────────
---  PLAYER CACHE  (rebuilt on join/leave, never stale)
+--  PLAYER CACHE
 -- ─────────────────────────────────────────────────────────────
 local playerCache = {}
 local function rebuildCache()
@@ -52,11 +48,11 @@ Players.PlayerAdded:Connect(rebuildCache)
 Players.PlayerRemoving:Connect(function() task.defer(rebuildCache) end)
 
 -- ─────────────────────────────────────────────────────────────
---  NEAREST ENEMY  (cached per frame to avoid repeated loops)
+--  NEAREST ENEMY  (cached)
 -- ─────────────────────────────────────────────────────────────
 local nearestCache     = nil
 local nearestCacheTime = 0
-local NEAREST_TTL      = 0.08  -- seconds
+local NEAREST_TTL      = 0.08
 
 local function getNearestEnemy()
     local now = tick()
@@ -64,66 +60,300 @@ local function getNearestEnemy()
     local myChar = LP.Character
     local myHRP  = myChar and myChar:FindFirstChild("HumanoidRootPart")
     if not myHRP then nearestCache=nil nearestCacheTime=now return nil end
-    local best, bestDSq = nil, math.huge
+    local best, bDSq = nil, math.huge
     for _, p in ipairs(playerCache) do
         local hrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
         if hrp then
             local d = (hrp.Position - myHRP.Position).Magnitude
-            if d * d < bestDSq then bestDSq = d*d best = p end
+            if d*d < bDSq then bDSq=d*d best=p end
         end
     end
-    nearestCache     = best
-    nearestCacheTime = now
+    nearestCache=best nearestCacheTime=now
     return best
 end
 
 -- ─────────────────────────────────────────────────────────────
---  CORE CONFIG  (all timings in seconds)
+--  MASTER CONFIG
 -- ─────────────────────────────────────────────────────────────
 local Config = {
-    -- Master
-    Enabled          = false,
+    -- Void Spam
+    VoidEnabled      = false,
+    HideTime         = 0.22,
+    AttackTime       = 0.10,
+    ReturnDelay      = 0.06,
+    HideY            = -600,
+    JitterEnabled    = true,
+    JitterRange      = 3,
+    TargetMode       = "Closest",
 
-    -- Phase timings (auto-scaled by ping when PingScale = true)
-    HideTime         = 0.22,   -- how long we sit underground
-    AttackTime       = 0.10,   -- how long we sit on target before returning
-    ReturnDelay      = 0.06,   -- gap before returning to original pos
-
-    -- Slingshot bypass
+    -- Slingshot
     SlingEnabled     = true,
-    SlingPingScale   = true,   -- scale shot timing by ping
-    SlingShots       = 1,      -- shots per cycle (1 = safest, 3 = rage)
-    SlingDelay       = 0.04,   -- delay between multi-shots
+    SlingPingScale   = true,
+    SlingShots       = 1,
+    SlingDelay       = 0.04,
 
     -- Projectile void
     ProjVoidEnabled  = true,
 
-    -- Target
-    TargetMode       = "Closest",  -- "Closest" | "LowestHP" | "HighestHP"
+    -- Aim Assist + Auto Shoot
+    AimEnabled       = false,   -- master toggle (handicap + aim loop)
+    AimFOV           = 200,     -- screen-pixel radius
+    AimSmooth        = 0.18,    -- 0=instant snap, 1=no movement
+    AutoShoot        = false,   -- fires when on target
+    AutoShootFOV     = 80,      -- tighter FOV to actually pull trigger
 
-    -- Underground Y offset
-    HideY            = -600,
+    -- Desync (position spoofing)
+    DesyncEnabled    = false,
+    DesyncIntensity  = 1,       -- 1=full random, 0=off (slider 0-1)
 
-    -- Anti-return detection: if we are seen returning too fast, add jitter
-    JitterEnabled    = true,
-    JitterRange      = 3,      -- studs of random offset on hide position
+    -- Handicap controller handle
+    HandicapLoaded   = false,
+    DebugController  = nil,
 
-    -- Internal runtime
-    Running          = false,
-    CycleConn        = nil,
+    -- runtime
+    VoidRunning      = false,
+    VoidCycleConn    = nil,
     ProjConn         = nil,
     ProjChildAdd     = nil,
     ProjChildRem     = nil,
+    AimConn          = nil,
+    DesyncHBConn     = nil,
+    DesyncRSConn     = nil,
 }
 
 -- ─────────────────────────────────────────────────────────────
---  PROJECTILE TRACKING  (CoreProjectile only — Rivals specific)
+--  HANDICAP / AIM ASSIST CONTROLLER
+--  require() the game's own DebugController and flip the flag
+-- ─────────────────────────────────────────────────────────────
+local function loadHandicapController()
+    if Config.HandicapLoaded then return true end
+    local ok, dc = pcall(function()
+        return require(
+            LP.PlayerScripts
+              :WaitForChild("Controllers", 5)
+              :WaitForChild("DebugController", 5)
+        )
+    end)
+    if ok and dc then
+        Config.DebugController = dc
+        Config.HandicapLoaded  = true
+        print("[exploit] DebugController acquired")
+        return true
+    end
+    warn("[exploit] DebugController not found — aim assist hardware path unavailable")
+    return false
+end
+
+local function enableHandicap(state)
+    if not Config.HandicapLoaded then
+        if not loadHandicapController() then return end
+    end
+    pcall(function()
+        Config.DebugController:SetHandicapsEnabled(state)
+    end)
+    print("[exploit] SetHandicapsEnabled(" .. tostring(state) .. ")")
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  AIM ASSIST  (smooth camera pull toward nearest enemy head)
+--  Works on PC. On mobile the camera is already touch-driven
+--  so we skip the CFrame manipulation and rely on the handicap.
+-- ─────────────────────────────────────────────────────────────
+local isMobile = UserInputService.TouchEnabled
+                 and not UserInputService.KeyboardEnabled
+
+local function getNearestInFOV(fov)
+    local vp     = Cam.ViewportSize
+    local center = Vector2.new(vp.X/2, vp.Y/2)
+    local best, bestDist = nil, math.huge
+    for _, p in ipairs(playerCache) do
+        local chr  = p.Character
+        local head = chr and chr:FindFirstChild("Head")
+        local hum  = chr and chr:FindFirstChildOfClass("Humanoid")
+        if head and hum and hum.Health > 0 then
+            local sp, onScreen = Cam:WorldToScreenPoint(head.Position)
+            if onScreen then
+                local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+                if d < fov and d < bestDist then
+                    bestDist = d best = p
+                end
+            end
+        end
+    end
+    return best, bestDist
+end
+
+local SHOOT_KW = {
+    "shoot","fire","attack","cast","launch",
+    "throw","use","action","hit","trigger","release",
+}
+
+local function fireCurrentTool()
+    local chr  = LP.Character
+    if not chr then return end
+    local tool = chr:FindFirstChildOfClass("Tool")
+    if not tool then return end
+    pcall(function() tool:Activate() end)
+    for _, v in ipairs(tool:GetDescendants()) do
+        if v:IsA("RemoteEvent") or v:IsA("RemoteFunction") then
+            local nl = v.Name:lower()
+            for _, kw in ipairs(SHOOT_KW) do
+                if nl:find(kw) then
+                    pcall(function() v:FireServer() end)
+                    break
+                end
+            end
+        end
+    end
+end
+
+local function startAim()
+    if Config.AimConn then Config.AimConn:Disconnect() end
+
+    -- enable the game's own handicap system
+    enableHandicap(true)
+
+    if isMobile then
+        -- on mobile the handicap does the heavy lifting
+        -- no CFrame manipulation needed
+        print("[exploit] Aim assist: mobile mode (handicap only)")
+        return
+    end
+
+    -- PC: smooth camera pull every RenderStepped
+    Config.AimConn = RunService.RenderStepped:Connect(function()
+        if not Config.AimEnabled then return end
+
+        local target, dist = getNearestInFOV(Config.AimFOV)
+        if not target then return end
+
+        local head = target.Character and target.Character:FindFirstChild("Head")
+        if not head then return end
+
+        -- smooth interpolation toward head
+        local smooth = math.clamp(Config.AimSmooth, 0, 0.99)
+        local goalCF = CFrame.new(Cam.CFrame.Position, head.Position)
+        Cam.CFrame   = Cam.CFrame:Lerp(goalCF, 1 - smooth)
+
+        -- auto shoot if within tighter FOV
+        if Config.AutoShoot and dist < Config.AutoShootFOV then
+            fireCurrentTool()
+        end
+    end)
+end
+
+local function stopAim()
+    if Config.AimConn then Config.AimConn:Disconnect() Config.AimConn=nil end
+    enableHandicap(false)
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  DESYNC  (position spoofing — the two-script technique)
+--
+--  How it works:
+--    Heartbeat  → teleport HRP to a random coordinate so the
+--                 server sees a crazy position (anti-lag, resolver break)
+--    RenderStep → immediately restore the real CFrame so locally
+--                 you see yourself standing still
+--
+--  Intensity slider scales the random range:
+--    0.0 = off
+--    0.5 = ±500M studs
+--    1.0 = ±2.1B studs (full original range)
+-- ─────────────────────────────────────────────────────────────
+
+-- same betterRandom as the original — avoids the "dead zone" near 0
+local function betterRandom(mi, ma, dmi, dma)
+    local val = math.random(mi, ma)
+    local iter = 0
+    repeat
+        val  = math.random(mi, ma)
+        iter = iter + 1
+    until val < dmi or val > dma or iter > 20
+    return val
+end
+
+local desyncHRP   = nil
+local desyncCF    = nil
+local desyncLV    = nil
+local desyncAV    = nil
+
+local function startDesync()
+    if Config.DesyncHBConn then Config.DesyncHBConn:Disconnect() end
+    if Config.DesyncRSConn then Config.DesyncRSConn:Disconnect() end
+
+    Config.DesyncHBConn = RunService.Heartbeat:Connect(function()
+        pcall(function()
+            local chr = LP.Character
+            desyncHRP = chr and chr:FindFirstChild("HumanoidRootPart")
+            if not desyncHRP then return end
+
+            -- save real state
+            desyncCF = desyncHRP.CFrame
+            desyncLV = desyncHRP.AssemblyLinearVelocity
+            desyncAV = desyncHRP.AssemblyAngularVelocity
+
+            -- scale range by intensity
+            local intensity = Config.DesyncIntensity
+            local R  = math.floor(2147483646 * intensity)
+            local DR = math.floor(1147483646 * intensity)
+            if R  < 2 then R  = 2  end
+            if DR < 1 then DR = 1  end
+            if DR >= R then DR = R - 1 end
+
+            local rx = betterRandom(-R, R, -DR, DR)
+            local ry = betterRandom(-R, R, -DR, DR)
+            local rz = betterRandom(-R, R, -DR, DR)
+
+            -- spoof to server
+            desyncHRP.CFrame = CFrame.new(rx, ry, rz)
+                * CFrame.Angles(math.rad(math.pi), math.rad(math.pi), math.rad(math.pi))
+            desyncHRP.AssemblyLinearVelocity = Vector3.new(
+                betterRandom(-R, R, -DR, DR),
+                betterRandom(-R, R, -DR, DR),
+                betterRandom(-R, R, -DR, DR)
+            )
+            desyncHRP.AssemblyAngularVelocity = Vector3.new(
+                betterRandom(-R, R, -DR, DR),
+                betterRandom(-R, R, -DR, DR),
+                betterRandom(-R, R, -DR, DR)
+            )
+        end)
+    end)
+
+    -- restore before render — client sees real position
+    RunService:BindToRenderStep("_desync_restore", Enum.RenderPriority.First.Value, function()
+        if desyncHRP then
+            pcall(function()
+                desyncHRP.CFrame = desyncCF
+                desyncHRP.AssemblyLinearVelocity  = desyncLV
+                desyncHRP.AssemblyAngularVelocity = desyncAV
+            end)
+        end
+    end)
+
+    Config.DesyncRSConn = true  -- flag so we know to unbind
+end
+
+local function stopDesync()
+    if Config.DesyncHBConn then
+        Config.DesyncHBConn:Disconnect()
+        Config.DesyncHBConn = nil
+    end
+    if Config.DesyncRSConn then
+        pcall(function() RunService:UnbindFromRenderStep("_desync_restore") end)
+        Config.DesyncRSConn = nil
+    end
+    desyncHRP = nil
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  PROJECTILE VOID
 -- ─────────────────────────────────────────────────────────────
 local projTracked = {}
 
 local function startProjVoid()
     if Config.ProjChildAdd then Config.ProjChildAdd:Disconnect() end
-    if Config.ProjChildRem then Config.ProjChildRem:Disconnect() end
     if Config.ProjConn     then Config.ProjConn:Disconnect()     end
 
     local VOID = CFrame.new(9e3, 9e3, 9e3)
@@ -133,19 +363,14 @@ local function startProjVoid()
             projTracked[o] = true
         end
     end)
-
-    -- also catch projectiles parented inside models
     workspace.DescendantAdded:Connect(function(o)
         if o.Name == "CoreProjectile" and o:IsA("BasePart") then
             projTracked[o] = true
         end
     end)
-
     Config.ProjChildRem = workspace.ChildRemoved:Connect(function(o)
         projTracked[o] = nil
     end)
-
-    -- scan existing
     for _, d in ipairs(workspace:GetDescendants()) do
         if d.Name == "CoreProjectile" and d:IsA("BasePart") then
             projTracked[d] = true
@@ -154,10 +379,9 @@ local function startProjVoid()
 
     Config.ProjConn = RunService.Heartbeat:Connect(function()
         if not Config.ProjVoidEnabled then return end
-        local vcf = VOID
         for part in pairs(projTracked) do
             if part and part.Parent then
-                part.CFrame = vcf
+                part.CFrame = VOID
                 part.AssemblyLinearVelocity  = Vector3.zero
                 part.AssemblyAngularVelocity = Vector3.zero
             else
@@ -179,241 +403,149 @@ end
 -- ─────────────────────────────────────────────────────────────
 local function getTarget()
     if #playerCache == 0 then return nil end
-
     if Config.TargetMode == "Closest" then
         return getNearestEnemy()
-
     elseif Config.TargetMode == "LowestHP" then
         local best, bHP = nil, math.huge
         for _, p in ipairs(playerCache) do
             local hum = p.Character and p.Character:FindFirstChildOfClass("Humanoid")
-            if hum and hum.Health > 0 and hum.Health < bHP then
-                bHP=hum.Health best=p
-            end
+            if hum and hum.Health > 0 and hum.Health < bHP then bHP=hum.Health best=p end
         end
         return best
-
     elseif Config.TargetMode == "HighestHP" then
         local best, bHP = nil, -math.huge
         for _, p in ipairs(playerCache) do
             local hum = p.Character and p.Character:FindFirstChildOfClass("Humanoid")
-            if hum and hum.Health > 0 and hum.Health > bHP then
-                bHP=hum.Health best=p
-            end
+            if hum and hum.Health > 0 and hum.Health > bHP then bHP=hum.Health best=p end
         end
         return best
     end
-
     return getNearestEnemy()
 end
 
 -- ─────────────────────────────────────────────────────────────
---  PING-COMPENSATED SHOT TIMING
---
---  Rivals slingshot is validated server-side using the time
---  the projectile was created vs when it hits.
---  Higher ping = more "lead time" you need to fire earlier.
---  We scale HideTime so we appear, fire, then vanish before
---  the server's AC tick can react.
+--  PING-COMPENSATED TIMING
 -- ─────────────────────────────────────────────────────────────
-local function getScaledHideTime()
+local function scaledHideTime()
     if not Config.SlingPingScale then return Config.HideTime end
-    local ping   = getPing()
-    --[[
-        At 30ms ping:  HideTime stays as configured
-        At 80ms ping:  HideTime × 0.85  (appear faster, fire earlier)
-        At 150ms ping: HideTime × 0.7   (fire significantly earlier)
-        At 200ms+:     HideTime × 0.55  (very early fire window)
-
-        The idea: high ping means server processes our shot later,
-        so we need to fire sooner in our local timeline so the shot
-        arrives at the server during the same valid window.
-    ]]
-    local scale = math.clamp(1 - (ping - 30) / 400, 0.55, 1.0)
+    local scale = math.clamp(1 - (getPing() - 30) / 400, 0.55, 1.0)
     return Config.HideTime * scale
 end
 
-local function getScaledAttackTime()
+local function scaledAttackTime()
     if not Config.SlingPingScale then return Config.AttackTime end
-    local ping  = getPing()
-    --[[
-        At high ping we stay on target slightly longer because
-        our fire remotes take longer to reach the server.
-        Gives the packet time to arrive before we teleport away.
-    ]]
-    local scale = math.clamp(1 + (ping - 30) / 300, 1.0, 1.8)
+    local scale = math.clamp(1 + (getPing() - 30) / 300, 1.0, 1.8)
     return Config.AttackTime * scale
 end
 
 -- ─────────────────────────────────────────────────────────────
---  FIRE  —  shoots every possible remote in the equipped tool
--- ─────────────────────────────────────────────────────────────
-local SHOOT_KEYWORDS = {
-    "shoot","fire","attack","cast","launch","throw",
-    "use","action","hit","trigger","release",
-}
-
-local function fireCurrentTool()
-    local chr  = LP.Character
-    if not chr then return end
-    local tool = chr:FindFirstChildOfClass("Tool")
-    if not tool then return end
-
-    -- Activate fires client-side animation + may trigger server
-    pcall(function() tool:Activate() end)
-
-    -- Scan all descendants for remotes
-    for _, v in ipairs(tool:GetDescendants()) do
-        if v:IsA("RemoteEvent") or v:IsA("RemoteFunction") then
-            local nl = v.Name:lower()
-            for _, kw in ipairs(SHOOT_KEYWORDS) do
-                if nl:find(kw) then
-                    pcall(function() v:FireServer() end)
-                    break
-                end
-            end
-        end
-    end
-end
-
--- ─────────────────────────────────────────────────────────────
 --  VOID SPAM CYCLE
---  Phase 1 ─ sink underground (hide from opponent's screen)
---  Phase 2 ─ snap onto target + fire
---  Phase 3 ─ return to original position
---
---  Why this beats HvH:
---    Your opponent's bypass voids enemies every Heartbeat.
---    While you're underground you don't exist in normal space
---    so their void loop voids thin air.
---    You snap up for ~100ms, fire, then vanish again.
---    At high ping their loop hasn't caught up yet.
 -- ─────────────────────────────────────────────────────────────
 local function runCycle()
-    if Config.Running then return end
-    Config.Running = true
+    if Config.VoidRunning then return end
+    Config.VoidRunning = true
 
     local target = getTarget()
     local myChar = LP.Character
     local myHRP  = myChar and myChar:FindFirstChild("HumanoidRootPart")
-
-    if not myHRP then
-        Config.Running = false
-        return
-    end
+    if not myHRP then Config.VoidRunning=false return end
 
     local origCF = myHRP.CFrame
+    local jx = Config.JitterEnabled and (math.random()-0.5)*2*Config.JitterRange or 0
+    local jz = Config.JitterEnabled and (math.random()-0.5)*2*Config.JitterRange or 0
 
-    -- jitter on hide pos so pattern is unpredictable
-    local jx = Config.JitterEnabled and (math.random() - 0.5) * 2 * Config.JitterRange or 0
-    local jz = Config.JitterEnabled and (math.random() - 0.5) * 2 * Config.JitterRange or 0
+    local hideCF = CFrame.new(origCF.Position.X+jx, Config.HideY, origCF.Position.Z+jz)
 
-    local hideCF = CFrame.new(
-        origCF.Position.X + jx,
-        Config.HideY,
-        origCF.Position.Z + jz
-    )
-
-    -- ── PHASE 1: sink underground ──
+    -- PHASE 1: sink
     myHRP.CFrame = hideCF
     myHRP.AssemblyLinearVelocity  = Vector3.zero
     myHRP.AssemblyAngularVelocity = Vector3.zero
 
-    task.wait(getScaledHideTime())
+    task.wait(scaledHideTime())
 
-    -- ── PHASE 2: snap to target + fire ──
+    -- PHASE 2: snap + fire
     local tChr = target and target.Character
-    local tHRP = tChr and tChr:FindFirstChild("HumanoidRootPart")
+    local tHRP = tChr  and tChr:FindFirstChild("HumanoidRootPart")
 
     if tHRP then
-        -- land just above target so shot is point-blank
         local snapCF = CFrame.new(
             tHRP.Position.X,
             tHRP.Position.Y + 2.5,
             tHRP.Position.Z
-        ) * CFrame.Angles(0, math.random(0, 628)/100, 0)
+        ) * CFrame.Angles(0, math.random(0,628)/100, 0)
 
         myHRP.CFrame = snapCF
         myHRP.AssemblyLinearVelocity  = Vector3.zero
         myHRP.AssemblyAngularVelocity = Vector3.zero
 
-        -- Fire N shots with tiny delay between them
         if Config.SlingEnabled then
             for i = 1, Config.SlingShots do
                 fireCurrentTool()
-                if i < Config.SlingShots then
-                    task.wait(Config.SlingDelay)
-                end
+                if i < Config.SlingShots then task.wait(Config.SlingDelay) end
             end
         end
 
-        task.wait(getScaledAttackTime())
+        task.wait(scaledAttackTime())
     end
 
-    -- ── PHASE 3: return ──
-    myHRP.CFrame = hideCF  -- dip back first so return isn't seen
-    myHRP.AssemblyLinearVelocity  = Vector3.zero
+    -- PHASE 3: return
+    myHRP.CFrame = hideCF
+    myHRP.AssemblyLinearVelocity = Vector3.zero
     task.wait(Config.ReturnDelay)
-
     myHRP.CFrame = origCF
-    myHRP.AssemblyLinearVelocity  = Vector3.zero
+    myHRP.AssemblyLinearVelocity = Vector3.zero
 
-    Config.Running = false
+    Config.VoidRunning = false
 end
 
 -- ─────────────────────────────────────────────────────────────
---  START / STOP
+--  START / STOP VOID SPAM
 -- ─────────────────────────────────────────────────────────────
 local function startVoidSpam()
-    Config.Enabled = true
-    Config.Running = false
-
+    Config.VoidEnabled  = true
+    Config.VoidRunning  = false
     if Config.ProjVoidEnabled then startProjVoid() end
-
-    Config.CycleConn = RunService.Heartbeat:Connect(function()
-        if Config.Enabled and not Config.Running then
+    Config.VoidCycleConn = RunService.Heartbeat:Connect(function()
+        if Config.VoidEnabled and not Config.VoidRunning then
             task.spawn(runCycle)
         end
     end)
 end
 
 local function stopVoidSpam()
-    Config.Enabled = false
-    Config.Running = false
-    if Config.CycleConn then Config.CycleConn:Disconnect() Config.CycleConn=nil end
+    Config.VoidEnabled  = false
+    Config.VoidRunning  = false
+    if Config.VoidCycleConn then
+        Config.VoidCycleConn:Disconnect()
+        Config.VoidCycleConn = nil
+    end
     stopProjVoid()
-
-    -- snap back to spawn if we got stuck underground
     pcall(function()
         local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
         if hrp and hrp.Position.Y < -50 then
             local sp = workspace:FindFirstChild("SpawnLocation")
-            hrp.CFrame = sp and sp.CFrame + Vector3.new(0,5,0)
-                           or CFrame.new(0, 10, 0)
+            hrp.CFrame = sp and sp.CFrame + Vector3.new(0,5,0) or CFrame.new(0,10,0)
         end
     end)
 end
 
 -- ─────────────────────────────────────────────────────────────
---  RESPAWN HANDLER
+--  RESPAWN
 -- ─────────────────────────────────────────────────────────────
 LP.CharacterAdded:Connect(function()
-    Config.Running = false
-    projTracked    = {}
-    nearestCache   = nil
-
+    Config.VoidRunning = false
+    projTracked        = {}
+    nearestCache       = nil
+    desyncHRP          = nil
     task.wait(0.5)
     rebuildCache()
-
-    if Config.Enabled then
-        stopVoidSpam()
-        task.wait(0.3)
-        startVoidSpam()
-    end
+    if Config.VoidEnabled    then stopVoidSpam()  task.wait(0.3) startVoidSpam()   end
+    if Config.AimEnabled     then startAim()                                        end
+    if Config.DesyncEnabled  then stopDesync()    task.wait(0.1) startDesync()     end
 end)
 
 -- ─────────────────────────────────────────────────────────────
---  UI PALETTE  —  clean dark mint
+--  UI PALETTE
 -- ─────────────────────────────────────────────────────────────
 local C = {
     bg      = Color3.fromRGB( 10,  12,  20),
@@ -425,6 +557,8 @@ local C = {
     warn    = Color3.fromRGB(255, 180,  40),
     blue    = Color3.fromRGB( 60, 160, 255),
     purple  = Color3.fromRGB(160,  80, 255),
+    pink    = Color3.fromRGB(255,  80, 200),
+    orange  = Color3.fromRGB(255, 140,  40),
     text    = Color3.fromRGB(230, 235, 245),
     sub     = Color3.fromRGB(120, 130, 160),
     off     = Color3.fromRGB( 40,  44,  66),
@@ -482,12 +616,11 @@ local function mkBtn(parent, text, size, color, textColor)
     b.AutoButtonColor  = false
     b.Parent           = parent
     mkCorner(b, 10)
-    -- hover
     b.MouseEnter:Connect(function()
         tw(b, {BackgroundColor3 = Color3.new(
-            math.min((color or C.accent).R + 0.08, 1),
-            math.min((color or C.accent).G + 0.08, 1),
-            math.min((color or C.accent).B + 0.08, 1)
+            math.min((color or C.accent).R+0.08,1),
+            math.min((color or C.accent).G+0.08,1),
+            math.min((color or C.accent).B+0.08,1)
         )}, 0.1)
     end)
     b.MouseLeave:Connect(function()
@@ -500,24 +633,17 @@ end
 --  SCREEN GUI
 -- ─────────────────────────────────────────────────────────────
 local SG = Instance.new("ScreenGui")
-SG.Name             = "VoidSpam"
-SG.ResetOnSpawn     = false
-SG.ZIndexBehavior   = Enum.ZIndexBehavior.Sibling
-SG.IgnoreGuiInset   = true
-SG.DisplayOrder     = 999
-SG.Parent           = LP:WaitForChild("PlayerGui")
+SG.Name           = "VoidSpam"
+SG.ResetOnSpawn   = false
+SG.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+SG.IgnoreGuiInset = true
+SG.DisplayOrder   = 999
+SG.Parent         = LP:WaitForChild("PlayerGui")
 
--- ─────────────────────────────────────────────────────────────
---  MAIN WINDOW
--- ─────────────────────────────────────────────────────────────
-local isMobile = UserInputService.TouchEnabled
-                 and not UserInputService.KeyboardEnabled
-
--- mobile: larger touch targets, positioned bottom-left
-local WIN_W = isMobile and 340 or 360
-local WIN_H = isMobile and 520 or 540
+local WIN_W = isMobile and 340 or 380
+local WIN_H = isMobile and 600 or 660
 local WIN_X = isMobile and 0.02 or 0.5
-local WIN_Y = isMobile and 0.38 or 0.5
+local WIN_Y = isMobile and 0.22 or 0.5
 
 local Main = Instance.new("Frame")
 Main.Name             = "Main"
@@ -528,12 +654,12 @@ Main.BackgroundColor3 = C.bg
 Main.BorderSizePixel  = 0
 Main.ClipsDescendants = false
 Main.Active           = true
-Main.Draggable        = not isMobile  -- mobile: fixed position
+Main.Draggable        = not isMobile
 Main.Parent           = SG
 mkCorner(Main, 16)
 mkStroke(Main, C.accent, 2)
 
--- mobile drag via touch
+-- mobile drag
 if isMobile then
     local dragStart, startPos
     Main.InputBegan:Connect(function(inp)
@@ -544,17 +670,12 @@ if isMobile then
     end)
     Main.InputChanged:Connect(function(inp)
         if inp.UserInputType == Enum.UserInputType.Touch and dragStart then
-            local delta = inp.Position - dragStart
-            Main.Position = UDim2.new(
-                0, startPos.X.Offset + delta.X,
-                0, startPos.Y.Offset + delta.Y
-            )
+            local d = inp.Position - dragStart
+            Main.Position = UDim2.new(0, startPos.X.Offset+d.X, 0, startPos.Y.Offset+d.Y)
         end
     end)
     Main.InputEnded:Connect(function(inp)
-        if inp.UserInputType == Enum.UserInputType.Touch then
-            dragStart = nil
-        end
+        if inp.UserInputType == Enum.UserInputType.Touch then dragStart=nil end
     end)
 end
 
@@ -562,432 +683,381 @@ end
 --  TITLE BAR
 -- ─────────────────────────────────────────────────────────────
 local TBar = Instance.new("Frame")
-TBar.Name             = "TBar"
-TBar.Size             = UDim2.new(1, 0, 0, 56)
+TBar.Size             = UDim2.new(1,0,0,56)
 TBar.BackgroundColor3 = C.surface
 TBar.BorderSizePixel  = 0
 TBar.ZIndex           = 2
 TBar.Parent           = Main
 mkCorner(TBar, 16)
 
--- fill bottom corners
 local TBarFill = Instance.new("Frame")
-TBarFill.Size             = UDim2.new(1, 0, 0.5, 0)
-TBarFill.Position         = UDim2.fromScale(0, 0.5)
+TBarFill.Size             = UDim2.new(1,0,0.5,0)
+TBarFill.Position         = UDim2.fromScale(0,0.5)
 TBarFill.BackgroundColor3 = C.surface
 TBarFill.BorderSizePixel  = 0
 TBarFill.ZIndex           = 2
 TBarFill.Parent           = TBar
 
--- accent left strip
 local strip = Instance.new("Frame")
-strip.Size             = UDim2.fromOffset(4, 32)
-strip.Position         = UDim2.fromOffset(14, 12)
+strip.Size             = UDim2.fromOffset(4,32)
+strip.Position         = UDim2.fromOffset(14,12)
 strip.BackgroundColor3 = C.accent
 strip.BorderSizePixel  = 0
 strip.ZIndex           = 3
 strip.Parent           = TBar
 mkCorner(strip, 2)
 
-local TitleLbl = mkLabel(TBar, "VOID SPAM", isMobile and 18 or 20, C.white, Enum.Font.GothamBlack)
-TitleLbl.Size     = UDim2.new(1, -120, 1, 0)
-TitleLbl.Position = UDim2.fromOffset(28, 0)
+local TitleLbl = mkLabel(TBar,"VOID SPAM",isMobile and 18 or 20,C.white,Enum.Font.GothamBlack)
+TitleLbl.Size     = UDim2.new(1,-120,1,0)
+TitleLbl.Position = UDim2.fromOffset(28,0)
 TitleLbl.ZIndex   = 3
 
-local SubLbl = mkLabel(TBar, "Rivals HvH  ·  Free", 10, C.sub, Enum.Font.Gotham)
-SubLbl.Size     = UDim2.new(1, -120, 0, 14)
-SubLbl.Position = UDim2.new(0, 28, 1, -16)
+local SubLbl = mkLabel(TBar,"Rivals HvH  ·  Free",10,C.sub,Enum.Font.Gotham)
+SubLbl.Size     = UDim2.new(1,-120,0,14)
+SubLbl.Position = UDim2.new(0,28,1,-16)
 SubLbl.ZIndex   = 3
 
--- ping display (updates every second)
-local PingLbl = mkLabel(TBar, "-- ms", 11, C.accent, Enum.Font.GothamBold,
+local PingLbl = mkLabel(TBar,"-- ms",11,C.accent,Enum.Font.GothamBold,
     Enum.TextXAlignment.Right)
-PingLbl.Size     = UDim2.fromOffset(70, 20)
-PingLbl.Position = UDim2.new(1, -110, 0.5, -10)
+PingLbl.Size     = UDim2.fromOffset(70,20)
+PingLbl.Position = UDim2.new(1,-110,0.5,-10)
 PingLbl.ZIndex   = 3
 
 task.spawn(function()
     while Main and Main.Parent do
         local p = getPing()
-        PingLbl.Text       = math.floor(p) .. " ms"
-        PingLbl.TextColor3 = p < 60  and C.accent
-                           or p < 120 and C.warn
-                           or            C.red
+        PingLbl.Text       = math.floor(p).." ms"
+        PingLbl.TextColor3 = p<60 and C.accent or p<120 and C.warn or C.red
         task.wait(1)
     end
 end)
 
--- close button
-local CloseBtn = mkBtn(TBar, "✕", 14, C.red, C.white)
+local CloseBtn = mkBtn(TBar,"✕",14,C.red,C.white)
 CloseBtn.Size     = UDim2.fromOffset(isMobile and 38 or 30, isMobile and 38 or 30)
-CloseBtn.Position = UDim2.new(1, -(isMobile and 46 or 38), 0.5, -(isMobile and 19 or 15))
+CloseBtn.Position = UDim2.new(1,-(isMobile and 46 or 38),0.5,-(isMobile and 19 or 15))
 CloseBtn.ZIndex   = 4
 CloseBtn.MouseButton1Click:Connect(function()
-    stopVoidSpam()
-    tw(Main, {Size=UDim2.fromOffset(WIN_W,0), BackgroundTransparency=1}, 0.2)
-    task.delay(0.22, function() SG:Destroy() end)
+    stopVoidSpam() stopAim() stopDesync()
+    tw(Main,{Size=UDim2.fromOffset(WIN_W,0),BackgroundTransparency=1},0.2)
+    task.delay(0.22,function() SG:Destroy() end)
 end)
 
 -- ─────────────────────────────────────────────────────────────
---  BIG TOGGLE BUTTON  (main on/off — biggest touch target)
+--  BIG TOGGLE  (void spam master)
 -- ─────────────────────────────────────────────────────────────
 local ToggleBtn = Instance.new("TextButton")
-ToggleBtn.Size             = UDim2.new(1, -20, 0, isMobile and 70 or 60)
-ToggleBtn.Position         = UDim2.fromOffset(10, 64)
+ToggleBtn.Size             = UDim2.new(1,-20,0,isMobile and 70 or 60)
+ToggleBtn.Position         = UDim2.fromOffset(10,64)
 ToggleBtn.BackgroundColor3 = C.off
 ToggleBtn.Text             = ""
 ToggleBtn.BorderSizePixel  = 0
 ToggleBtn.AutoButtonColor  = false
 ToggleBtn.ZIndex           = 2
 ToggleBtn.Parent           = Main
-mkCorner(ToggleBtn, 14)
-local toggleStroke = mkStroke(ToggleBtn, C.off, 2)
+mkCorner(ToggleBtn,14)
+local tStroke = mkStroke(ToggleBtn,C.off,2)
 
-local ToggleLbl = mkLabel(ToggleBtn, "START VOID SPAM",
-    isMobile and 18 or 16, C.sub, Enum.Font.GothamBlack,
-    Enum.TextXAlignment.Center)
-ToggleLbl.Size = UDim2.fromScale(1, 1)
+local ToggleLbl = mkLabel(ToggleBtn,"▶  START VOID SPAM",
+    isMobile and 18 or 16,C.sub,Enum.Font.GothamBlack,Enum.TextXAlignment.Center)
+ToggleLbl.Size = UDim2.fromScale(1,1)
 
-local function refreshToggleBtn()
-    local on = Config.Enabled
-    tw(ToggleBtn,  {BackgroundColor3 = on and C.accentD or C.off}, 0.18)
-    tw(toggleStroke, {Color = on and C.accent or C.off}, 0.18)
-    tw(ToggleLbl, {TextColor3 = on and C.white or C.sub}, 0.18)
+local function refreshVoidBtn()
+    local on = Config.VoidEnabled
+    tw(ToggleBtn,{BackgroundColor3=on and C.accentD or C.off},0.18)
+    tw(tStroke,  {Color=on and C.accent or C.off},0.18)
+    tw(ToggleLbl,{TextColor3=on and C.white or C.sub},0.18)
     ToggleLbl.Text = on and "⬛  STOP VOID SPAM" or "▶  START VOID SPAM"
 end
 
 ToggleBtn.MouseButton1Click:Connect(function()
-    if Config.Enabled then
-        stopVoidSpam()
-    else
-        startVoidSpam()
-    end
-    refreshToggleBtn()
+    if Config.VoidEnabled then stopVoidSpam() else startVoidSpam() end
+    refreshVoidBtn()
 end)
 
 -- ─────────────────────────────────────────────────────────────
---  STATUS STRIP
+--  STATUS BAR
 -- ─────────────────────────────────────────────────────────────
+local statusTop = 64 + (isMobile and 70 or 60) + 8
+
 local StatusFrame = Instance.new("Frame")
-StatusFrame.Size             = UDim2.new(1, -20, 0, 28)
-StatusFrame.Position         = UDim2.fromOffset(10, 64 + (isMobile and 70 or 60) + 8)
+StatusFrame.Size             = UDim2.new(1,-20,0,28)
+StatusFrame.Position         = UDim2.fromOffset(10,statusTop)
 StatusFrame.BackgroundColor3 = C.surface
 StatusFrame.BorderSizePixel  = 0
 StatusFrame.Parent           = Main
-mkCorner(StatusFrame, 8)
+mkCorner(StatusFrame,8)
 
-local StatusLbl = mkLabel(StatusFrame, "● IDLE  |  target: --  |  ping: --",
-    10, C.sub, Enum.Font.GothamSemibold, Enum.TextXAlignment.Center)
-StatusLbl.Size = UDim2.fromScale(1, 1)
+local StatusLbl = mkLabel(StatusFrame,"● IDLE  |  --  |  -- ms",
+    10,C.sub,Enum.Font.GothamSemibold,Enum.TextXAlignment.Center)
+StatusLbl.Size = UDim2.fromScale(1,1)
 
--- update status every 0.5s
 task.spawn(function()
     while Main and Main.Parent do
-        local target = getTarget()
-        local ping   = math.floor(getPing())
-        local state  = Config.Running and "● FIRING" or Config.Enabled and "● WAITING" or "● IDLE"
-        local col    = Config.Running and C.red or Config.Enabled and C.accent or C.sub
-        StatusLbl.Text       = state .. "  |  " ..
-                               (target and target.Name or "none") ..
-                               "  |  " .. ping .. "ms"
+        local tgt  = getTarget()
+        local ping = math.floor(getPing())
+        local aimS = Config.AimEnabled  and " AIM" or ""
+        local dsS  = Config.DesyncEnabled and " DSYNC" or ""
+        local stateS = Config.VoidRunning and "● FIRE"
+                    or Config.VoidEnabled and "● WAIT"
+                    or                       "● IDLE"
+        local col = Config.VoidRunning and C.red
+                 or Config.VoidEnabled and C.accent
+                 or                       C.sub
+        StatusLbl.Text       = stateS..aimS..dsS
+                               .."  |  "..(tgt and tgt.Name or "none")
+                               .."  |  "..ping.."ms"
         StatusLbl.TextColor3 = col
         task.wait(0.5)
     end
 end)
 
 -- ─────────────────────────────────────────────────────────────
---  SCROLL AREA  (settings cards)
+--  SCROLL
 -- ─────────────────────────────────────────────────────────────
-local scrollTop = 64 + (isMobile and 70 or 60) + 8 + 28 + 8
+local scrollTop = statusTop + 28 + 8
 
 local Scroll = Instance.new("ScrollingFrame")
-Scroll.Size                  = UDim2.new(1, -20, 1, -(scrollTop + 10))
-Scroll.Position              = UDim2.fromOffset(10, scrollTop)
-Scroll.BackgroundTransparency = 1
+Scroll.Size                  = UDim2.new(1,-20,1,-(scrollTop+10))
+Scroll.Position              = UDim2.fromOffset(10,scrollTop)
+Scroll.BackgroundTransparency= 1
 Scroll.BorderSizePixel       = 0
 Scroll.ScrollBarThickness    = 3
 Scroll.ScrollBarImageColor3  = C.accent
-Scroll.CanvasSize            = UDim2.fromOffset(0, 0)
+Scroll.CanvasSize            = UDim2.fromOffset(0,0)
 Scroll.AutomaticCanvasSize   = Enum.AutomaticSize.Y
 Scroll.Parent                = Main
 
 local List = Instance.new("UIListLayout")
 List.SortOrder = Enum.SortOrder.LayoutOrder
-List.Padding   = UDim.new(0, 8)
+List.Padding   = UDim.new(0,8)
 List.Parent    = Scroll
 
 local Pad = Instance.new("UIPadding")
-Pad.PaddingTop    = UDim.new(0, 4)
-Pad.PaddingBottom = UDim.new(0, 8)
-Pad.PaddingLeft   = UDim.new(0, 2)
-Pad.PaddingRight  = UDim.new(0, 2)
-Pad.Parent        = Scroll
+Pad.PaddingTop=UDim.new(0,4) Pad.PaddingBottom=UDim.new(0,8)
+Pad.PaddingLeft=UDim.new(0,2) Pad.PaddingRight=UDim.new(0,2)
+Pad.Parent = Scroll
 
 -- ─────────────────────────────────────────────────────────────
---  UI COMPONENT FACTORIES
+--  COMPONENT FACTORIES
 -- ─────────────────────────────────────────────────────────────
-
--- ── section header ───────────────────────────────────────────
-local orderCounter = 0
-local function nextOrder()
-    orderCounter = orderCounter + 1
-    return orderCounter
-end
+local order = 0
+local function nO() order=order+1 return order end
 
 local function mkSep(text)
     local f = Instance.new("Frame")
-    f.LayoutOrder        = nextOrder()
-    f.Size               = UDim2.new(1, 0, 0, 20)
+    f.LayoutOrder        = nO()
+    f.Size               = UDim2.new(1,0,0,20)
     f.BackgroundTransparency = 1
     f.Parent             = Scroll
-
-    local l = mkLabel(f, text, 10, C.sub, Enum.Font.GothamBold)
-    l.Size               = UDim2.new(0, 100, 1, 0)
-
+    local l = mkLabel(f,text,10,C.sub,Enum.Font.GothamBold)
+    l.Size = UDim2.new(0,110,1,0)
     local line = Instance.new("Frame")
-    line.Size            = UDim2.new(1, -108, 0, 1)
-    line.Position        = UDim2.new(0, 104, 0.5, 0)
-    line.BackgroundColor3 = C.accent
-    line.BackgroundTransparency = 0.72
+    line.Size            = UDim2.new(1,-118,0,1)
+    line.Position        = UDim2.new(0,114,0.5,0)
+    line.BackgroundColor3= C.accent
+    line.BackgroundTransparency=0.72
     line.BorderSizePixel = 0
     line.Parent          = f
 end
 
--- ── toggle row ───────────────────────────────────────────────
-local function mkToggle(title, sub, cfgKey, onColor)
+-- generic toggle card
+local function mkToggle(title, sub, cfgKey, onColor, onChangeCb)
     local h   = isMobile and 62 or 54
     onColor   = onColor or C.accent
 
     local card = Instance.new("Frame")
-    card.LayoutOrder      = nextOrder()
-    card.Size             = UDim2.new(1, 0, 0, h)
+    card.LayoutOrder      = nO()
+    card.Size             = UDim2.new(1,0,0,h)
     card.BackgroundColor3 = C.card
     card.BorderSizePixel  = 0
     card.Parent           = Scroll
-    mkCorner(card, 12)
-    local cs = mkStroke(card, C.off, 1.5)
+    mkCorner(card,12)
+    local cs = mkStroke(card,C.off,1.5)
 
-    local tLbl = mkLabel(card, title, isMobile and 14 or 13, C.text, Enum.Font.GothamBold)
-    tLbl.Size     = UDim2.new(1, -90, 0, 20)
-    tLbl.Position = UDim2.fromOffset(12, h/2 - (sub~="" and 14 or 10))
+    local tLbl = mkLabel(card,title,isMobile and 14 or 13,C.text,Enum.Font.GothamBold)
+    tLbl.Size     = UDim2.new(1,-90,0,20)
+    tLbl.Position = UDim2.fromOffset(12, sub~="" and h/2-14 or h/2-10)
 
     if sub ~= "" then
-        local sLbl = mkLabel(card, sub, isMobile and 11 or 10, C.sub, Enum.Font.Gotham)
-        sLbl.Size     = UDim2.new(1, -90, 0, 14)
-        sLbl.Position = UDim2.fromOffset(12, h/2 + 2)
+        local sLbl = mkLabel(card,sub,isMobile and 11 or 10,C.sub,Enum.Font.Gotham)
+        sLbl.Size     = UDim2.new(1,-90,0,14)
+        sLbl.Position = UDim2.fromOffset(12,h/2+2)
     end
 
-    -- pill
+    local pw  = isMobile and 58 or 52
+    local ph  = isMobile and 28 or 24
+    local kSz = isMobile and 20 or 18
+
     local pill = Instance.new("Frame")
-    pill.Size             = UDim2.fromOffset(isMobile and 58 or 52, isMobile and 28 or 24)
-    pill.Position         = UDim2.new(1, -(isMobile and 68 or 62),
-                                       0.5, -(isMobile and 14 or 12))
+    pill.Size             = UDim2.fromOffset(pw,ph)
+    pill.Position         = UDim2.new(1,-(pw+10),0.5,-ph/2)
     pill.BackgroundColor3 = Config[cfgKey] and onColor or C.off
     pill.BorderSizePixel  = 0
     pill.Parent           = card
-    mkCorner(pill, isMobile and 14 or 12)
+    mkCorner(pill,ph/2)
 
     local knob = Instance.new("Frame")
-    local kSize = isMobile and 20 or 18
-    knob.Size             = UDim2.fromOffset(kSize, kSize)
+    knob.Size             = UDim2.fromOffset(kSz,kSz)
     knob.Position         = Config[cfgKey]
-        and UDim2.fromOffset((isMobile and 58 or 52) - kSize - 4, 4)
-        or  UDim2.fromOffset(4, 4)
+        and UDim2.fromOffset(pw-kSz-4,4) or UDim2.fromOffset(4,4)
     knob.BackgroundColor3 = C.white
     knob.BorderSizePixel  = 0
     knob.Parent           = pill
-    mkCorner(knob, kSize/2)
+    mkCorner(knob,kSz/2)
 
-    local pillTxt = mkLabel(pill,
-        Config[cfgKey] and "ON" or "OFF",
-        9, C.white, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
-    pillTxt.Size = UDim2.fromScale(1, 1)
+    local pillTxt = mkLabel(pill,Config[cfgKey] and "ON" or "OFF",
+        9,C.white,Enum.Font.GothamBold,Enum.TextXAlignment.Center)
+    pillTxt.Size = UDim2.fromScale(1,1)
 
     local hit = Instance.new("TextButton")
-    hit.Size               = UDim2.fromScale(1, 1)
-    hit.BackgroundTransparency = 1
+    hit.Size               = UDim2.fromScale(1,1)
+    hit.BackgroundTransparency=1
     hit.Text               = ""
     hit.ZIndex             = 5
     hit.Parent             = card
 
     local function refresh()
-        local on  = Config[cfgKey]
-        local kOff = (isMobile and 58 or 52) - kSize - 4
-        tw(pill,  {BackgroundColor3 = on and onColor or C.off}, 0.14)
-        tw(knob,  {Position = on
-            and UDim2.fromOffset(kOff, 4)
-            or  UDim2.fromOffset(4, 4)}, 0.14)
-        tw(cs,    {Color = on and onColor or C.off}, 0.14)
+        local on = Config[cfgKey]
+        tw(pill,{BackgroundColor3=on and onColor or C.off},0.14)
+        tw(knob,{Position=on
+            and UDim2.fromOffset(pw-kSz-4,4)
+            or  UDim2.fromOffset(4,4)},0.14)
+        tw(cs,{Color=on and onColor or C.off},0.14)
         pillTxt.Text = on and "ON" or "OFF"
     end
 
     hit.MouseButton1Click:Connect(function()
         Config[cfgKey] = not Config[cfgKey]
         refresh()
-        -- side effect handlers
-        if cfgKey == "ProjVoidEnabled" then
-            if Config[cfgKey] and Config.Enabled then
-                startProjVoid()
-            elseif not Config[cfgKey] then
-                stopProjVoid()
-            end
-        end
-        if cfgKey == "JitterEnabled" or cfgKey == "SlingEnabled"
-           or cfgKey == "SlingPingScale" then
-            -- no extra action needed, value is read each cycle
-        end
-        -- icon bounce
-        tw(card, {BackgroundColor3 = Color3.fromRGB(30,34,58)}, 0.07)
-        task.delay(0.1, function()
-            tw(card, {BackgroundColor3 = C.card}, 0.12)
-        end)
+        if onChangeCb then onChangeCb(Config[cfgKey]) end
+        tw(card,{BackgroundColor3=Color3.fromRGB(30,34,58)},0.07)
+        task.delay(0.1,function() tw(card,{BackgroundColor3=C.card},0.12) end)
     end)
-
-    hit.MouseEnter:Connect(function()
-        tw(card, {BackgroundColor3 = Color3.fromRGB(28,32,56)}, 0.1)
-    end)
-    hit.MouseLeave:Connect(function()
-        tw(card, {BackgroundColor3 = C.card}, 0.1)
-    end)
+    hit.MouseEnter:Connect(function() tw(card,{BackgroundColor3=Color3.fromRGB(28,32,56)},0.1) end)
+    hit.MouseLeave:Connect(function() tw(card,{BackgroundColor3=C.card},0.1) end)
 end
 
--- ── slider row ───────────────────────────────────────────────
-local function mkSlider(title, cfgKey, min, max, decimals, suffix, fillColor)
+-- generic slider card
+local function mkSlider(title, cfgKey, mn, mx, decimals, suffix, fillColor, onChangeCb)
     local h = isMobile and 70 or 62
     fillColor = fillColor or C.accent
 
     local card = Instance.new("Frame")
-    card.LayoutOrder      = nextOrder()
-    card.Size             = UDim2.new(1, 0, 0, h)
+    card.LayoutOrder      = nO()
+    card.Size             = UDim2.new(1,0,0,h)
     card.BackgroundColor3 = C.card
     card.BorderSizePixel  = 0
     card.Parent           = Scroll
-    mkCorner(card, 12)
-    mkStroke(card, C.off, 1.5)
+    mkCorner(card,12)
+    mkStroke(card,C.off,1.5)
 
-    local fmt = decimals > 0
-        and ("%." .. decimals .. "f")
-        or  "%d"
+    local fmt = decimals>0 and ("%."..decimals.."f") or "%d"
 
     local valLbl = mkLabel(card,
-        title .. "  " .. string.format(fmt, Config[cfgKey]) .. (suffix or ""),
-        isMobile and 13 or 12, C.text, Enum.Font.GothamBold)
-    valLbl.Size     = UDim2.new(1, -16, 0, 20)
-    valLbl.Position = UDim2.fromOffset(12, 10)
+        title.."  "..string.format(fmt,Config[cfgKey])..(suffix or ""),
+        isMobile and 13 or 12,C.text,Enum.Font.GothamBold)
+    valLbl.Size     = UDim2.new(1,-16,0,20)
+    valLbl.Position = UDim2.fromOffset(12,10)
 
     local trackBg = Instance.new("Frame")
-    trackBg.Size             = UDim2.new(1, -24, 0, isMobile and 12 or 10)
-    trackBg.Position         = UDim2.fromOffset(12, h - (isMobile and 24 or 22))
+    trackBg.Size             = UDim2.new(1,-24,0,isMobile and 12 or 10)
+    trackBg.Position         = UDim2.fromOffset(12,h-(isMobile and 24 or 22))
     trackBg.BackgroundColor3 = C.off
     trackBg.BorderSizePixel  = 0
     trackBg.Parent           = card
-    mkCorner(trackBg, 5)
+    mkCorner(trackBg,5)
 
-    local pct  = (Config[cfgKey] - min) / (max - min)
+    local pct  = (Config[cfgKey]-mn)/(mx-mn)
     local fill = Instance.new("Frame")
-    fill.Size             = UDim2.fromScale(math.clamp(pct, 0, 1), 1)
+    fill.Size             = UDim2.fromScale(math.clamp(pct,0,1),1)
     fill.BackgroundColor3 = fillColor
     fill.BorderSizePixel  = 0
     fill.Parent           = trackBg
-    mkCorner(fill, 5)
+    mkCorner(fill,5)
 
     local dragging = false
     local function updateVal(x)
-        local rel = math.clamp(
-            (x - trackBg.AbsolutePosition.X) / trackBg.AbsoluteSize.X,
-            0, 1
-        )
-        local raw = min + rel * (max - min)
-        local val = decimals > 0
-            and math.floor(raw * 10^decimals + 0.5) / 10^decimals
-            or  math.floor(raw + 0.5)
+        local rel = math.clamp((x-trackBg.AbsolutePosition.X)/trackBg.AbsoluteSize.X,0,1)
+        local raw = mn + rel*(mx-mn)
+        local val = decimals>0
+            and math.floor(raw*10^decimals+0.5)/10^decimals
+            or  math.floor(raw+0.5)
         Config[cfgKey] = val
-        fill.Size      = UDim2.fromScale(rel, 1)
-        valLbl.Text    = title .. "  " .. string.format(fmt, val) .. (suffix or "")
+        fill.Size      = UDim2.fromScale(rel,1)
+        valLbl.Text    = title.."  "..string.format(fmt,val)..(suffix or "")
+        if onChangeCb then onChangeCb(val) end
     end
 
     local hitArea = Instance.new("TextButton")
-    hitArea.Size               = UDim2.new(1, 0, 1, isMobile and 20 or 14)
-    hitArea.Position           = UDim2.fromOffset(0, -(isMobile and 10 or 7))
-    hitArea.BackgroundTransparency = 1
+    hitArea.Size               = UDim2.new(1,0,1,isMobile and 20 or 14)
+    hitArea.Position           = UDim2.fromOffset(0,-(isMobile and 10 or 7))
+    hitArea.BackgroundTransparency=1
     hitArea.Text               = ""
     hitArea.ZIndex             = 5
     hitArea.Parent             = trackBg
 
-    -- PC mouse
     hitArea.MouseButton1Down:Connect(function(x) dragging=true updateVal(x) end)
     UserInputService.InputChanged:Connect(function(inp)
-        if dragging and inp.UserInputType == Enum.UserInputType.MouseMovement then
+        if dragging and inp.UserInputType==Enum.UserInputType.MouseMovement then
             updateVal(inp.Position.X)
         end
     end)
     UserInputService.InputEnded:Connect(function(inp)
-        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging = false
-        end
+        if inp.UserInputType==Enum.UserInputType.MouseButton1 then dragging=false end
     end)
-
-    -- Mobile touch
     hitArea.InputBegan:Connect(function(inp)
-        if inp.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            updateVal(inp.Position.X)
-        end
+        if inp.UserInputType==Enum.UserInputType.Touch then dragging=true updateVal(inp.Position.X) end
     end)
     hitArea.InputChanged:Connect(function(inp)
-        if dragging and inp.UserInputType == Enum.UserInputType.Touch then
-            updateVal(inp.Position.X)
-        end
+        if dragging and inp.UserInputType==Enum.UserInputType.Touch then updateVal(inp.Position.X) end
     end)
     hitArea.InputEnded:Connect(function(inp)
-        if inp.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
-        end
+        if inp.UserInputType==Enum.UserInputType.Touch then dragging=false end
     end)
 end
 
--- ── dropdown row ─────────────────────────────────────────────
+-- dropdown card
 local function mkDropdown(title, cfgKey, options, fillColor)
     fillColor = fillColor or C.accent
     local h   = isMobile and 58 or 50
 
     local card = Instance.new("Frame")
-    card.LayoutOrder      = nextOrder()
-    card.Size             = UDim2.new(1, 0, 0, h)
+    card.LayoutOrder      = nO()
+    card.Size             = UDim2.new(1,0,0,h)
     card.BackgroundColor3 = C.card
     card.BorderSizePixel  = 0
     card.ClipsDescendants = false
     card.Parent           = Scroll
-    mkCorner(card, 12)
-    mkStroke(card, C.off, 1.5)
+    mkCorner(card,12)
+    mkStroke(card,C.off,1.5)
 
-    local tLbl = mkLabel(card, title, isMobile and 13 or 12, C.sub, Enum.Font.GothamSemibold)
-    tLbl.Size     = UDim2.new(0.45, 0, 1, 0)
-    tLbl.Position = UDim2.fromOffset(12, 0)
+    local tLbl = mkLabel(card,title,isMobile and 13 or 12,C.sub,Enum.Font.GothamSemibold)
+    tLbl.Size     = UDim2.new(0.45,0,1,0)
+    tLbl.Position = UDim2.fromOffset(12,0)
 
     local valBtn = Instance.new("TextButton")
-    valBtn.Size             = UDim2.new(0.5, 0, 0, h - 16)
-    valBtn.Position         = UDim2.new(0.48, 0, 0.5, -(h-16)/2)
+    valBtn.Size             = UDim2.new(0.5,0,0,h-16)
+    valBtn.Position         = UDim2.new(0.48,0,0.5,-(h-16)/2)
     valBtn.BackgroundColor3 = C.surface
     valBtn.TextColor3       = C.white
     valBtn.Font             = Enum.Font.GothamBold
     valBtn.TextSize         = isMobile and 13 or 12
-    valBtn.Text             = Config[cfgKey] .. " ▾"
+    valBtn.Text             = Config[cfgKey].." ▾"
     valBtn.BorderSizePixel  = 0
     valBtn.ZIndex           = 2
     valBtn.Parent           = card
-    mkCorner(valBtn, 8)
+    mkCorner(valBtn,8)
 
     local dropFrame = Instance.new("Frame")
-    dropFrame.Size             = UDim2.new(0.5, 0, 0, #options * (isMobile and 40 or 34))
-    dropFrame.Position         = UDim2.new(0.48, 0, 1, 4)
+    dropFrame.Size             = UDim2.new(0.5,0,0,#options*(isMobile and 40 or 34))
+    dropFrame.Position         = UDim2.new(0.48,0,1,4)
     dropFrame.BackgroundColor3 = C.surface
     dropFrame.BorderSizePixel  = 0
     dropFrame.Visible          = false
     dropFrame.ZIndex           = 20
     dropFrame.Parent           = card
-    mkCorner(dropFrame, 8)
-    mkStroke(dropFrame, fillColor, 1.5)
+    mkCorner(dropFrame,8)
+    mkStroke(dropFrame,fillColor,1.5)
 
     local dList = Instance.new("UIListLayout")
     dList.SortOrder = Enum.SortOrder.LayoutOrder
@@ -996,8 +1066,8 @@ local function mkDropdown(title, cfgKey, options, fillColor)
     for i, opt in ipairs(options) do
         local ob = Instance.new("TextButton")
         ob.LayoutOrder      = i
-        ob.Size             = UDim2.new(1, 0, 0, isMobile and 40 or 34)
-        ob.BackgroundColor3 = Config[cfgKey] == opt and fillColor or C.surface
+        ob.Size             = UDim2.new(1,0,0,isMobile and 40 or 34)
+        ob.BackgroundColor3 = Config[cfgKey]==opt and fillColor or C.surface
         ob.TextColor3       = C.white
         ob.Font             = Enum.Font.GothamSemibold
         ob.TextSize         = isMobile and 13 or 12
@@ -1005,138 +1075,174 @@ local function mkDropdown(title, cfgKey, options, fillColor)
         ob.BorderSizePixel  = 0
         ob.ZIndex           = 21
         ob.Parent           = dropFrame
-        if i == 1 then mkCorner(ob, 8) end
 
         ob.MouseButton1Click:Connect(function()
             Config[cfgKey] = opt
-            valBtn.Text    = opt .. " ▾"
+            valBtn.Text    = opt.." ▾"
             dropFrame.Visible = false
-            -- colour all options
-            for _, c in ipairs(dropFrame:GetChildren()) do
-                if c:IsA("TextButton") then
-                    c.BackgroundColor3 = c.Text == opt and fillColor or C.surface
+            nearestCache   = nil
+            for _, ch in ipairs(dropFrame:GetChildren()) do
+                if ch:IsA("TextButton") then
+                    ch.BackgroundColor3 = ch.Text==opt and fillColor or C.surface
                 end
             end
-            nearestCache = nil  -- reset nearest cache on target change
         end)
     end
 
     local open = false
-    valBtn.MouseButton1Click:Connect(function()
-        open = not open
-        dropFrame.Visible = open
-    end)
-
-    -- close when clicking elsewhere
+    valBtn.MouseButton1Click:Connect(function() open=not open dropFrame.Visible=open end)
     UserInputService.InputBegan:Connect(function(inp)
-        if open and (inp.UserInputType == Enum.UserInputType.MouseButton1
-                  or inp.UserInputType == Enum.UserInputType.Touch) then
+        if open and (inp.UserInputType==Enum.UserInputType.MouseButton1
+                  or inp.UserInputType==Enum.UserInputType.Touch) then
             task.defer(function()
-                if dropFrame.Visible then
-                    dropFrame.Visible = false
-                    open = false
-                end
+                if dropFrame.Visible then dropFrame.Visible=false open=false end
             end)
         end
     end)
 end
 
 -- ─────────────────────────────────────────────────────────────
---  BUILD UI SECTIONS
+--  BUILD UI
 -- ─────────────────────────────────────────────────────────────
 
+-- TARGET
 mkSep("TARGET")
-mkDropdown("Target Mode", "TargetMode", {"Closest","LowestHP","HighestHP"}, C.blue)
+mkDropdown("Target Mode","TargetMode",{"Closest","LowestHP","HighestHP"},C.blue)
 
+-- VOID SPAM TIMING
 mkSep("VOID SPAM TIMING")
-mkSlider("Hide Time",    "HideTime",    0.05, 0.6,  2, "s",  C.accent)
-mkSlider("Attack Time",  "AttackTime",  0.03, 0.4,  2, "s",  C.accent)
-mkSlider("Return Delay", "ReturnDelay", 0.02, 0.3,  2, "s",  C.sub)
-mkSlider("Hide Y",       "HideY",       -2000,-100, 0, " Y", C.purple)
+mkSlider("Hide Time",   "HideTime",   0.05,0.6,  2,"s",  C.accent)
+mkSlider("Attack Time", "AttackTime", 0.03,0.4,  2,"s",  C.accent)
+mkSlider("Return Delay","ReturnDelay",0.02,0.3,  2,"s",  C.sub)
+mkSlider("Hide Y",      "HideY",      -2000,-100,0," Y", C.purple)
 
+-- SLINGSHOT
 mkSep("SLINGSHOT BYPASS")
-mkToggle("Sling Fire",      "Auto-fires on snap",              "SlingEnabled",    C.accent)
-mkToggle("Ping Scale",      "Adjusts timing by ping (HvH rec)","SlingPingScale",  C.blue)
-mkSlider("Shots / Cycle",   "SlingShots",  1, 5, 0, "",   C.warn)
-mkSlider("Shot Delay",      "SlingDelay",  0, 0.15, 2, "s", C.warn)
+mkToggle("Sling Fire",    "Auto-fires on snap",            "SlingEnabled", C.accent)
+mkToggle("Ping Scale",    "Adjust timing by ping",         "SlingPingScale",C.blue)
+mkSlider("Shots / Cycle", "SlingShots", 1,5,0,"",          C.warn)
+mkSlider("Shot Delay",    "SlingDelay", 0,0.15,2,"s",       C.warn)
 
+-- PROJECTILE VOID
 mkSep("PROJECTILE VOID")
-mkToggle("Void CoreProjectile", "Teleports enemy shots to void", "ProjVoidEnabled", C.red)
+mkToggle("Void CoreProjectile","Teleports enemy shots to void","ProjVoidEnabled",C.red,
+    function(v) if v then startProjVoid() else stopProjVoid() end end)
 
+-- ── AIM ASSIST ───────────────────────────────────────────────
+mkSep("AIM ASSIST  +  AUTO SHOOT  (PC)")
+
+mkToggle(
+    "Aim Assist",
+    "Handicap API + smooth camera lock to head",
+    "AimEnabled",
+    C.blue,
+    function(v)
+        if v then startAim() else stopAim() end
+    end
+)
+
+mkToggle(
+    "Auto Shoot",
+    "Fires when locked within Auto Shoot FOV",
+    "AutoShoot",
+    C.orange,
+    nil  -- no extra action, picked up in aim loop
+)
+
+mkSlider("Aim FOV",        "AimFOV",        50, 700, 0, " px",  C.blue)
+mkSlider("Aim Smooth",     "AimSmooth",     0,  0.98,2, "",     C.blue,
+    nil  -- picked up each RenderStepped
+)
+mkSlider("Auto Shoot FOV", "AutoShootFOV",  20, 400, 0, " px",  C.orange)
+
+-- ── DESYNC ───────────────────────────────────────────────────
+mkSep("DESYNC  (position spoof)")
+
+mkToggle(
+    "Desync",
+    "Server sees random pos, client sees real pos",
+    "DesyncEnabled",
+    C.pink,
+    function(v)
+        if v then startDesync() else stopDesync() end
+    end
+)
+
+-- ── DESYNC ───────────────────────────────────────────────────
+mkSep("DESYNC  (position spoof)")
+
+mkToggle(
+    "Desync",
+    "Server sees random pos, client sees real pos",
+    "DesyncEnabled",
+    C.pink,
+    function(v)
+        if v then startDesync() else stopDesync() end
+    end
+)
+
+mkSlider(
+    "Desync Intensity",
+    "DesyncIntensity",
+    0, 1, 2, "x",
+    C.pink,
+    nil  -- read per Heartbeat cycle automatically
+)
+
+-- ── ANTI-DETECTION ───────────────────────────────────────────
 mkSep("ANTI-DETECTION")
-mkToggle("Position Jitter", "Randomises hide position slightly","JitterEnabled",   C.purple)
-mkSlider("Jitter Range",    "JitterRange", 0, 10, 0, " studs", C.purple)
+mkToggle("Position Jitter","Randomise hide position","JitterEnabled",C.purple)
+mkSlider("Jitter Range",   "JitterRange",0,10,0," studs",C.purple)
 
--- ─────────────────────────────────────────────────────────────
---  PRESET BUTTONS ROW
--- ─────────────────────────────────────────────────────────────
+-- ── PRESETS ──────────────────────────────────────────────────
 mkSep("PRESETS")
 
 local presetRow = Instance.new("Frame")
-presetRow.LayoutOrder      = nextOrder()
-presetRow.Size             = UDim2.new(1, 0, 0, isMobile and 50 or 42)
-presetRow.BackgroundTransparency = 1
-presetRow.Parent           = Scroll
+presetRow.LayoutOrder        = nO()
+presetRow.Size               = UDim2.new(1,0,0,isMobile and 50 or 42)
+presetRow.BackgroundTransparency=1
+presetRow.Parent             = Scroll
 
 local presetList = Instance.new("UIListLayout")
-presetList.FillDirection   = Enum.FillDirection.Horizontal
-presetList.SortOrder       = Enum.SortOrder.LayoutOrder
-presetList.Padding         = UDim.new(0, 6)
-presetList.Parent          = presetRow
+presetList.FillDirection = Enum.FillDirection.Horizontal
+presetList.SortOrder     = Enum.SortOrder.LayoutOrder
+presetList.Padding       = UDim.new(0,6)
+presetList.Parent        = presetRow
 
-local function mkPreset(label, fn, color)
-    local b = mkBtn(presetRow, label, isMobile and 12 or 11, color, C.white)
-    b.LayoutOrder  = nextOrder()
-    b.Size         = UDim2.new(0.31, -4, 1, 0)
+local function mkPreset(lbl, fn, col)
+    local b = mkBtn(presetRow,lbl,isMobile and 12 or 11,col,C.white)
+    b.LayoutOrder = nO()
+    b.Size        = UDim2.new(0.31,-4,1,0)
     b.MouseButton1Click:Connect(fn)
 end
 
--- SAFE preset — good for low ping, cautious
 mkPreset("SAFE", function()
-    Config.HideTime       = 0.28
-    Config.AttackTime     = 0.12
-    Config.ReturnDelay    = 0.08
-    Config.SlingShots     = 1
-    Config.SlingDelay     = 0.05
-    Config.JitterEnabled  = true
-    Config.JitterRange    = 5
-    Config.SlingPingScale = true
+    Config.HideTime=0.28 Config.AttackTime=0.12 Config.ReturnDelay=0.08
+    Config.SlingShots=1  Config.SlingDelay=0.05
+    Config.JitterEnabled=true Config.JitterRange=5 Config.SlingPingScale=true
+    Config.DesyncIntensity=0.5
 end, C.accentD)
 
--- RAGE preset — maximum aggression
 mkPreset("RAGE", function()
-    Config.HideTime       = 0.10
-    Config.AttackTime     = 0.06
-    Config.ReturnDelay    = 0.03
-    Config.SlingShots     = 3
-    Config.SlingDelay     = 0.03
-    Config.JitterEnabled  = false
-    Config.JitterRange    = 0
-    Config.SlingPingScale = false
+    Config.HideTime=0.10 Config.AttackTime=0.06 Config.ReturnDelay=0.03
+    Config.SlingShots=3  Config.SlingDelay=0.03
+    Config.JitterEnabled=false Config.JitterRange=0 Config.SlingPingScale=false
+    Config.DesyncIntensity=1.0
 end, C.red)
 
--- HIGH PING preset — tuned for 150ms+
 mkPreset("HIGH PING", function()
-    Config.HideTime       = 0.15
-    Config.AttackTime     = 0.20
-    Config.ReturnDelay    = 0.05
-    Config.SlingShots     = 2
-    Config.SlingDelay     = 0.04
-    Config.JitterEnabled  = true
-    Config.JitterRange    = 3
-    Config.SlingPingScale = true
+    Config.HideTime=0.15 Config.AttackTime=0.20 Config.ReturnDelay=0.05
+    Config.SlingShots=2  Config.SlingDelay=0.04
+    Config.JitterEnabled=true Config.JitterRange=3 Config.SlingPingScale=true
+    Config.DesyncIntensity=0.7
 end, C.warn)
 
 -- ─────────────────────────────────────────────────────────────
 --  OPEN ANIMATION
 -- ─────────────────────────────────────────────────────────────
-tw(Main,
-    {Size = UDim2.fromOffset(WIN_W, WIN_H)},
-    0.28, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+tw(Main,{Size=UDim2.fromOffset(WIN_W,WIN_H)},
+    0.28,Enum.EasingStyle.Back,Enum.EasingDirection.Out)
 
 -- ─────────────────────────────────────────────────────────────
---  DONE
--- ─────────────────────────────────────────────────────────────
-print("[VoidSpam] loaded for " .. LP.Name)
-print("[VoidSpam] Mobile: " .. tostring(isMobile))
-print("[VoidSpam] Ping:   " .. math.floor(getPing()) .. "ms")
+print("[VoidSpam] loaded — "..LP.Name.." | mobile="..tostring(isMobile)
+      .." | ping="..math.floor(getPing()).."ms")
