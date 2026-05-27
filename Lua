@@ -1,0 +1,1142 @@
+--[[
+    ██╗   ██╗ ██████╗ ██╗██████╗     ███████╗██████╗  █████╗ ███╗   ███╗
+    ██║   ██║██╔═══██╗██║██╔══██╗    ██╔════╝██╔══██╗██╔══██╗████╗ ████║
+    ██║   ██║██║   ██║██║██║  ██║    ███████╗██████╔╝███████║██╔████╔██║
+    ╚██╗ ██╔╝██║   ██║██║██║  ██║    ╚════██║██╔═══╝ ██╔══██║██║╚██╔╝██║
+     ╚████╔╝ ╚██████╔╝██║██████╔╝    ███████║██║     ██║  ██║██║ ╚═╝ ██║
+      ╚═══╝   ╚═════╝ ╚═╝╚═════╝     ╚══════╝╚═╝     ╚═╝  ╚═╝╚═╝     ╚═╝
+
+    VOID SPAM  —  Roblox Rivals HvH
+    Free. No key. No bullshit.
+    Ping-compensated slingshot bypass included.
+    Mobile + PC.
+]]
+
+-- ─────────────────────────────────────────────────────────────
+--  SERVICES
+-- ─────────────────────────────────────────────────────────────
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local Stats            = game:GetService("Stats")
+
+local LP  = Players.LocalPlayer
+local Cam = workspace.CurrentCamera
+
+-- ─────────────────────────────────────────────────────────────
+--  PING UTILITY
+--  Rivals is ping-based for slingshot hit reg.
+--  We read real network ping and scale our bypass timings.
+-- ─────────────────────────────────────────────────────────────
+local function getPing()
+    -- Stats.Network is the most accurate client-side ping source
+    local ok, ping = pcall(function()
+        return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+    end)
+    return ok and ping or 80  -- fallback 80ms if unavailable
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  PLAYER CACHE  (rebuilt on join/leave, never stale)
+-- ─────────────────────────────────────────────────────────────
+local playerCache = {}
+local function rebuildCache()
+    playerCache = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LP then table.insert(playerCache, p) end
+    end
+end
+rebuildCache()
+Players.PlayerAdded:Connect(rebuildCache)
+Players.PlayerRemoving:Connect(function() task.defer(rebuildCache) end)
+
+-- ─────────────────────────────────────────────────────────────
+--  NEAREST ENEMY  (cached per frame to avoid repeated loops)
+-- ─────────────────────────────────────────────────────────────
+local nearestCache     = nil
+local nearestCacheTime = 0
+local NEAREST_TTL      = 0.08  -- seconds
+
+local function getNearestEnemy()
+    local now = tick()
+    if now - nearestCacheTime < NEAREST_TTL then return nearestCache end
+    local myChar = LP.Character
+    local myHRP  = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myHRP then nearestCache=nil nearestCacheTime=now return nil end
+    local best, bestDSq = nil, math.huge
+    for _, p in ipairs(playerCache) do
+        local hrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local d = (hrp.Position - myHRP.Position).Magnitude
+            if d * d < bestDSq then bestDSq = d*d best = p end
+        end
+    end
+    nearestCache     = best
+    nearestCacheTime = now
+    return best
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  CORE CONFIG  (all timings in seconds)
+-- ─────────────────────────────────────────────────────────────
+local Config = {
+    -- Master
+    Enabled          = false,
+
+    -- Phase timings (auto-scaled by ping when PingScale = true)
+    HideTime         = 0.22,   -- how long we sit underground
+    AttackTime       = 0.10,   -- how long we sit on target before returning
+    ReturnDelay      = 0.06,   -- gap before returning to original pos
+
+    -- Slingshot bypass
+    SlingEnabled     = true,
+    SlingPingScale   = true,   -- scale shot timing by ping
+    SlingShots       = 1,      -- shots per cycle (1 = safest, 3 = rage)
+    SlingDelay       = 0.04,   -- delay between multi-shots
+
+    -- Projectile void
+    ProjVoidEnabled  = true,
+
+    -- Target
+    TargetMode       = "Closest",  -- "Closest" | "LowestHP" | "HighestHP"
+
+    -- Underground Y offset
+    HideY            = -600,
+
+    -- Anti-return detection: if we are seen returning too fast, add jitter
+    JitterEnabled    = true,
+    JitterRange      = 3,      -- studs of random offset on hide position
+
+    -- Internal runtime
+    Running          = false,
+    CycleConn        = nil,
+    ProjConn         = nil,
+    ProjChildAdd     = nil,
+    ProjChildRem     = nil,
+}
+
+-- ─────────────────────────────────────────────────────────────
+--  PROJECTILE TRACKING  (CoreProjectile only — Rivals specific)
+-- ─────────────────────────────────────────────────────────────
+local projTracked = {}
+
+local function startProjVoid()
+    if Config.ProjChildAdd then Config.ProjChildAdd:Disconnect() end
+    if Config.ProjChildRem then Config.ProjChildRem:Disconnect() end
+    if Config.ProjConn     then Config.ProjConn:Disconnect()     end
+
+    local VOID = CFrame.new(9e3, 9e3, 9e3)
+
+    Config.ProjChildAdd = workspace.ChildAdded:Connect(function(o)
+        if o.Name == "CoreProjectile" and o:IsA("BasePart") then
+            projTracked[o] = true
+        end
+    end)
+
+    -- also catch projectiles parented inside models
+    workspace.DescendantAdded:Connect(function(o)
+        if o.Name == "CoreProjectile" and o:IsA("BasePart") then
+            projTracked[o] = true
+        end
+    end)
+
+    Config.ProjChildRem = workspace.ChildRemoved:Connect(function(o)
+        projTracked[o] = nil
+    end)
+
+    -- scan existing
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if d.Name == "CoreProjectile" and d:IsA("BasePart") then
+            projTracked[d] = true
+        end
+    end
+
+    Config.ProjConn = RunService.Heartbeat:Connect(function()
+        if not Config.ProjVoidEnabled then return end
+        local vcf = VOID
+        for part in pairs(projTracked) do
+            if part and part.Parent then
+                part.CFrame = vcf
+                part.AssemblyLinearVelocity  = Vector3.zero
+                part.AssemblyAngularVelocity = Vector3.zero
+            else
+                projTracked[part] = nil
+            end
+        end
+    end)
+end
+
+local function stopProjVoid()
+    if Config.ProjChildAdd then Config.ProjChildAdd:Disconnect() Config.ProjChildAdd=nil end
+    if Config.ProjChildRem then Config.ProjChildRem:Disconnect() Config.ProjChildRem=nil end
+    if Config.ProjConn     then Config.ProjConn:Disconnect()     Config.ProjConn=nil     end
+    projTracked = {}
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  TARGET SELECTION
+-- ─────────────────────────────────────────────────────────────
+local function getTarget()
+    if #playerCache == 0 then return nil end
+
+    if Config.TargetMode == "Closest" then
+        return getNearestEnemy()
+
+    elseif Config.TargetMode == "LowestHP" then
+        local best, bHP = nil, math.huge
+        for _, p in ipairs(playerCache) do
+            local hum = p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 and hum.Health < bHP then
+                bHP=hum.Health best=p
+            end
+        end
+        return best
+
+    elseif Config.TargetMode == "HighestHP" then
+        local best, bHP = nil, -math.huge
+        for _, p in ipairs(playerCache) do
+            local hum = p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 and hum.Health > bHP then
+                bHP=hum.Health best=p
+            end
+        end
+        return best
+    end
+
+    return getNearestEnemy()
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  PING-COMPENSATED SHOT TIMING
+--
+--  Rivals slingshot is validated server-side using the time
+--  the projectile was created vs when it hits.
+--  Higher ping = more "lead time" you need to fire earlier.
+--  We scale HideTime so we appear, fire, then vanish before
+--  the server's AC tick can react.
+-- ─────────────────────────────────────────────────────────────
+local function getScaledHideTime()
+    if not Config.SlingPingScale then return Config.HideTime end
+    local ping   = getPing()
+    --[[
+        At 30ms ping:  HideTime stays as configured
+        At 80ms ping:  HideTime × 0.85  (appear faster, fire earlier)
+        At 150ms ping: HideTime × 0.7   (fire significantly earlier)
+        At 200ms+:     HideTime × 0.55  (very early fire window)
+
+        The idea: high ping means server processes our shot later,
+        so we need to fire sooner in our local timeline so the shot
+        arrives at the server during the same valid window.
+    ]]
+    local scale = math.clamp(1 - (ping - 30) / 400, 0.55, 1.0)
+    return Config.HideTime * scale
+end
+
+local function getScaledAttackTime()
+    if not Config.SlingPingScale then return Config.AttackTime end
+    local ping  = getPing()
+    --[[
+        At high ping we stay on target slightly longer because
+        our fire remotes take longer to reach the server.
+        Gives the packet time to arrive before we teleport away.
+    ]]
+    local scale = math.clamp(1 + (ping - 30) / 300, 1.0, 1.8)
+    return Config.AttackTime * scale
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  FIRE  —  shoots every possible remote in the equipped tool
+-- ─────────────────────────────────────────────────────────────
+local SHOOT_KEYWORDS = {
+    "shoot","fire","attack","cast","launch","throw",
+    "use","action","hit","trigger","release",
+}
+
+local function fireCurrentTool()
+    local chr  = LP.Character
+    if not chr then return end
+    local tool = chr:FindFirstChildOfClass("Tool")
+    if not tool then return end
+
+    -- Activate fires client-side animation + may trigger server
+    pcall(function() tool:Activate() end)
+
+    -- Scan all descendants for remotes
+    for _, v in ipairs(tool:GetDescendants()) do
+        if v:IsA("RemoteEvent") or v:IsA("RemoteFunction") then
+            local nl = v.Name:lower()
+            for _, kw in ipairs(SHOOT_KEYWORDS) do
+                if nl:find(kw) then
+                    pcall(function() v:FireServer() end)
+                    break
+                end
+            end
+        end
+    end
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  VOID SPAM CYCLE
+--  Phase 1 ─ sink underground (hide from opponent's screen)
+--  Phase 2 ─ snap onto target + fire
+--  Phase 3 ─ return to original position
+--
+--  Why this beats HvH:
+--    Your opponent's bypass voids enemies every Heartbeat.
+--    While you're underground you don't exist in normal space
+--    so their void loop voids thin air.
+--    You snap up for ~100ms, fire, then vanish again.
+--    At high ping their loop hasn't caught up yet.
+-- ─────────────────────────────────────────────────────────────
+local function runCycle()
+    if Config.Running then return end
+    Config.Running = true
+
+    local target = getTarget()
+    local myChar = LP.Character
+    local myHRP  = myChar and myChar:FindFirstChild("HumanoidRootPart")
+
+    if not myHRP then
+        Config.Running = false
+        return
+    end
+
+    local origCF = myHRP.CFrame
+
+    -- jitter on hide pos so pattern is unpredictable
+    local jx = Config.JitterEnabled and (math.random() - 0.5) * 2 * Config.JitterRange or 0
+    local jz = Config.JitterEnabled and (math.random() - 0.5) * 2 * Config.JitterRange or 0
+
+    local hideCF = CFrame.new(
+        origCF.Position.X + jx,
+        Config.HideY,
+        origCF.Position.Z + jz
+    )
+
+    -- ── PHASE 1: sink underground ──
+    myHRP.CFrame = hideCF
+    myHRP.AssemblyLinearVelocity  = Vector3.zero
+    myHRP.AssemblyAngularVelocity = Vector3.zero
+
+    task.wait(getScaledHideTime())
+
+    -- ── PHASE 2: snap to target + fire ──
+    local tChr = target and target.Character
+    local tHRP = tChr and tChr:FindFirstChild("HumanoidRootPart")
+
+    if tHRP then
+        -- land just above target so shot is point-blank
+        local snapCF = CFrame.new(
+            tHRP.Position.X,
+            tHRP.Position.Y + 2.5,
+            tHRP.Position.Z
+        ) * CFrame.Angles(0, math.random(0, 628)/100, 0)
+
+        myHRP.CFrame = snapCF
+        myHRP.AssemblyLinearVelocity  = Vector3.zero
+        myHRP.AssemblyAngularVelocity = Vector3.zero
+
+        -- Fire N shots with tiny delay between them
+        if Config.SlingEnabled then
+            for i = 1, Config.SlingShots do
+                fireCurrentTool()
+                if i < Config.SlingShots then
+                    task.wait(Config.SlingDelay)
+                end
+            end
+        end
+
+        task.wait(getScaledAttackTime())
+    end
+
+    -- ── PHASE 3: return ──
+    myHRP.CFrame = hideCF  -- dip back first so return isn't seen
+    myHRP.AssemblyLinearVelocity  = Vector3.zero
+    task.wait(Config.ReturnDelay)
+
+    myHRP.CFrame = origCF
+    myHRP.AssemblyLinearVelocity  = Vector3.zero
+
+    Config.Running = false
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  START / STOP
+-- ─────────────────────────────────────────────────────────────
+local function startVoidSpam()
+    Config.Enabled = true
+    Config.Running = false
+
+    if Config.ProjVoidEnabled then startProjVoid() end
+
+    Config.CycleConn = RunService.Heartbeat:Connect(function()
+        if Config.Enabled and not Config.Running then
+            task.spawn(runCycle)
+        end
+    end)
+end
+
+local function stopVoidSpam()
+    Config.Enabled = false
+    Config.Running = false
+    if Config.CycleConn then Config.CycleConn:Disconnect() Config.CycleConn=nil end
+    stopProjVoid()
+
+    -- snap back to spawn if we got stuck underground
+    pcall(function()
+        local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+        if hrp and hrp.Position.Y < -50 then
+            local sp = workspace:FindFirstChild("SpawnLocation")
+            hrp.CFrame = sp and sp.CFrame + Vector3.new(0,5,0)
+                           or CFrame.new(0, 10, 0)
+        end
+    end)
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  RESPAWN HANDLER
+-- ─────────────────────────────────────────────────────────────
+LP.CharacterAdded:Connect(function()
+    Config.Running = false
+    projTracked    = {}
+    nearestCache   = nil
+
+    task.wait(0.5)
+    rebuildCache()
+
+    if Config.Enabled then
+        stopVoidSpam()
+        task.wait(0.3)
+        startVoidSpam()
+    end
+end)
+
+-- ─────────────────────────────────────────────────────────────
+--  UI PALETTE  —  clean dark mint
+-- ─────────────────────────────────────────────────────────────
+local C = {
+    bg      = Color3.fromRGB( 10,  12,  20),
+    surface = Color3.fromRGB( 18,  22,  38),
+    card    = Color3.fromRGB( 24,  28,  50),
+    accent  = Color3.fromRGB( 80, 220, 160),
+    accentD = Color3.fromRGB( 40, 160, 110),
+    red     = Color3.fromRGB(255,  70,  80),
+    warn    = Color3.fromRGB(255, 180,  40),
+    blue    = Color3.fromRGB( 60, 160, 255),
+    purple  = Color3.fromRGB(160,  80, 255),
+    text    = Color3.fromRGB(230, 235, 245),
+    sub     = Color3.fromRGB(120, 130, 160),
+    off     = Color3.fromRGB( 40,  44,  66),
+    white   = Color3.new(1,1,1),
+}
+
+-- ─────────────────────────────────────────────────────────────
+--  UI HELPERS
+-- ─────────────────────────────────────────────────────────────
+local function tw(obj, props, t, style, dir)
+    TweenService:Create(obj,
+        TweenInfo.new(t or 0.16,
+            style or Enum.EasingStyle.Quad,
+            dir   or Enum.EasingDirection.Out),
+        props):Play()
+end
+
+local function mkCorner(p, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 12)
+    c.Parent = p
+    return c
+end
+
+local function mkStroke(p, col, thick)
+    local s = Instance.new("UIStroke")
+    s.Color     = col   or C.accent
+    s.Thickness = thick or 1.5
+    s.Parent    = p
+    return s
+end
+
+local function mkLabel(parent, text, size, color, font, xa, ya)
+    local l = Instance.new("TextLabel")
+    l.BackgroundTransparency = 1
+    l.Text           = text
+    l.TextColor3     = color or C.text
+    l.Font           = font  or Enum.Font.GothamSemibold
+    l.TextSize       = size  or 14
+    l.TextXAlignment = xa    or Enum.TextXAlignment.Left
+    l.TextYAlignment = ya    or Enum.TextYAlignment.Center
+    l.TextWrapped    = true
+    l.Parent         = parent
+    return l
+end
+
+local function mkBtn(parent, text, size, color, textColor)
+    local b = Instance.new("TextButton")
+    b.BackgroundColor3 = color     or C.accent
+    b.TextColor3       = textColor or C.bg
+    b.Font             = Enum.Font.GothamBold
+    b.TextSize         = size      or 14
+    b.Text             = text
+    b.BorderSizePixel  = 0
+    b.AutoButtonColor  = false
+    b.Parent           = parent
+    mkCorner(b, 10)
+    -- hover
+    b.MouseEnter:Connect(function()
+        tw(b, {BackgroundColor3 = Color3.new(
+            math.min((color or C.accent).R + 0.08, 1),
+            math.min((color or C.accent).G + 0.08, 1),
+            math.min((color or C.accent).B + 0.08, 1)
+        )}, 0.1)
+    end)
+    b.MouseLeave:Connect(function()
+        tw(b, {BackgroundColor3 = color or C.accent}, 0.1)
+    end)
+    return b
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  SCREEN GUI
+-- ─────────────────────────────────────────────────────────────
+local SG = Instance.new("ScreenGui")
+SG.Name             = "VoidSpam"
+SG.ResetOnSpawn     = false
+SG.ZIndexBehavior   = Enum.ZIndexBehavior.Sibling
+SG.IgnoreGuiInset   = true
+SG.DisplayOrder     = 999
+SG.Parent           = LP:WaitForChild("PlayerGui")
+
+-- ─────────────────────────────────────────────────────────────
+--  MAIN WINDOW
+-- ─────────────────────────────────────────────────────────────
+local isMobile = UserInputService.TouchEnabled
+                 and not UserInputService.KeyboardEnabled
+
+-- mobile: larger touch targets, positioned bottom-left
+local WIN_W = isMobile and 340 or 360
+local WIN_H = isMobile and 520 or 540
+local WIN_X = isMobile and 0.02 or 0.5
+local WIN_Y = isMobile and 0.38 or 0.5
+
+local Main = Instance.new("Frame")
+Main.Name             = "Main"
+Main.Size             = UDim2.fromOffset(WIN_W, 0)
+Main.Position         = UDim2.new(WIN_X, 0, WIN_Y, 0)
+Main.AnchorPoint      = isMobile and Vector2.new(0,0) or Vector2.new(0.5,0.5)
+Main.BackgroundColor3 = C.bg
+Main.BorderSizePixel  = 0
+Main.ClipsDescendants = false
+Main.Active           = true
+Main.Draggable        = not isMobile  -- mobile: fixed position
+Main.Parent           = SG
+mkCorner(Main, 16)
+mkStroke(Main, C.accent, 2)
+
+-- mobile drag via touch
+if isMobile then
+    local dragStart, startPos
+    Main.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.Touch then
+            dragStart = inp.Position
+            startPos  = Main.Position
+        end
+    end)
+    Main.InputChanged:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.Touch and dragStart then
+            local delta = inp.Position - dragStart
+            Main.Position = UDim2.new(
+                0, startPos.X.Offset + delta.X,
+                0, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+    Main.InputEnded:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.Touch then
+            dragStart = nil
+        end
+    end)
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  TITLE BAR
+-- ─────────────────────────────────────────────────────────────
+local TBar = Instance.new("Frame")
+TBar.Name             = "TBar"
+TBar.Size             = UDim2.new(1, 0, 0, 56)
+TBar.BackgroundColor3 = C.surface
+TBar.BorderSizePixel  = 0
+TBar.ZIndex           = 2
+TBar.Parent           = Main
+mkCorner(TBar, 16)
+
+-- fill bottom corners
+local TBarFill = Instance.new("Frame")
+TBarFill.Size             = UDim2.new(1, 0, 0.5, 0)
+TBarFill.Position         = UDim2.fromScale(0, 0.5)
+TBarFill.BackgroundColor3 = C.surface
+TBarFill.BorderSizePixel  = 0
+TBarFill.ZIndex           = 2
+TBarFill.Parent           = TBar
+
+-- accent left strip
+local strip = Instance.new("Frame")
+strip.Size             = UDim2.fromOffset(4, 32)
+strip.Position         = UDim2.fromOffset(14, 12)
+strip.BackgroundColor3 = C.accent
+strip.BorderSizePixel  = 0
+strip.ZIndex           = 3
+strip.Parent           = TBar
+mkCorner(strip, 2)
+
+local TitleLbl = mkLabel(TBar, "VOID SPAM", isMobile and 18 or 20, C.white, Enum.Font.GothamBlack)
+TitleLbl.Size     = UDim2.new(1, -120, 1, 0)
+TitleLbl.Position = UDim2.fromOffset(28, 0)
+TitleLbl.ZIndex   = 3
+
+local SubLbl = mkLabel(TBar, "Rivals HvH  ·  Free", 10, C.sub, Enum.Font.Gotham)
+SubLbl.Size     = UDim2.new(1, -120, 0, 14)
+SubLbl.Position = UDim2.new(0, 28, 1, -16)
+SubLbl.ZIndex   = 3
+
+-- ping display (updates every second)
+local PingLbl = mkLabel(TBar, "-- ms", 11, C.accent, Enum.Font.GothamBold,
+    Enum.TextXAlignment.Right)
+PingLbl.Size     = UDim2.fromOffset(70, 20)
+PingLbl.Position = UDim2.new(1, -110, 0.5, -10)
+PingLbl.ZIndex   = 3
+
+task.spawn(function()
+    while Main and Main.Parent do
+        local p = getPing()
+        PingLbl.Text       = math.floor(p) .. " ms"
+        PingLbl.TextColor3 = p < 60  and C.accent
+                           or p < 120 and C.warn
+                           or            C.red
+        task.wait(1)
+    end
+end)
+
+-- close button
+local CloseBtn = mkBtn(TBar, "✕", 14, C.red, C.white)
+CloseBtn.Size     = UDim2.fromOffset(isMobile and 38 or 30, isMobile and 38 or 30)
+CloseBtn.Position = UDim2.new(1, -(isMobile and 46 or 38), 0.5, -(isMobile and 19 or 15))
+CloseBtn.ZIndex   = 4
+CloseBtn.MouseButton1Click:Connect(function()
+    stopVoidSpam()
+    tw(Main, {Size=UDim2.fromOffset(WIN_W,0), BackgroundTransparency=1}, 0.2)
+    task.delay(0.22, function() SG:Destroy() end)
+end)
+
+-- ─────────────────────────────────────────────────────────────
+--  BIG TOGGLE BUTTON  (main on/off — biggest touch target)
+-- ─────────────────────────────────────────────────────────────
+local ToggleBtn = Instance.new("TextButton")
+ToggleBtn.Size             = UDim2.new(1, -20, 0, isMobile and 70 or 60)
+ToggleBtn.Position         = UDim2.fromOffset(10, 64)
+ToggleBtn.BackgroundColor3 = C.off
+ToggleBtn.Text             = ""
+ToggleBtn.BorderSizePixel  = 0
+ToggleBtn.AutoButtonColor  = false
+ToggleBtn.ZIndex           = 2
+ToggleBtn.Parent           = Main
+mkCorner(ToggleBtn, 14)
+local toggleStroke = mkStroke(ToggleBtn, C.off, 2)
+
+local ToggleLbl = mkLabel(ToggleBtn, "START VOID SPAM",
+    isMobile and 18 or 16, C.sub, Enum.Font.GothamBlack,
+    Enum.TextXAlignment.Center)
+ToggleLbl.Size = UDim2.fromScale(1, 1)
+
+local function refreshToggleBtn()
+    local on = Config.Enabled
+    tw(ToggleBtn,  {BackgroundColor3 = on and C.accentD or C.off}, 0.18)
+    tw(toggleStroke, {Color = on and C.accent or C.off}, 0.18)
+    tw(ToggleLbl, {TextColor3 = on and C.white or C.sub}, 0.18)
+    ToggleLbl.Text = on and "⬛  STOP VOID SPAM" or "▶  START VOID SPAM"
+end
+
+ToggleBtn.MouseButton1Click:Connect(function()
+    if Config.Enabled then
+        stopVoidSpam()
+    else
+        startVoidSpam()
+    end
+    refreshToggleBtn()
+end)
+
+-- ─────────────────────────────────────────────────────────────
+--  STATUS STRIP
+-- ─────────────────────────────────────────────────────────────
+local StatusFrame = Instance.new("Frame")
+StatusFrame.Size             = UDim2.new(1, -20, 0, 28)
+StatusFrame.Position         = UDim2.fromOffset(10, 64 + (isMobile and 70 or 60) + 8)
+StatusFrame.BackgroundColor3 = C.surface
+StatusFrame.BorderSizePixel  = 0
+StatusFrame.Parent           = Main
+mkCorner(StatusFrame, 8)
+
+local StatusLbl = mkLabel(StatusFrame, "● IDLE  |  target: --  |  ping: --",
+    10, C.sub, Enum.Font.GothamSemibold, Enum.TextXAlignment.Center)
+StatusLbl.Size = UDim2.fromScale(1, 1)
+
+-- update status every 0.5s
+task.spawn(function()
+    while Main and Main.Parent do
+        local target = getTarget()
+        local ping   = math.floor(getPing())
+        local state  = Config.Running and "● FIRING" or Config.Enabled and "● WAITING" or "● IDLE"
+        local col    = Config.Running and C.red or Config.Enabled and C.accent or C.sub
+        StatusLbl.Text       = state .. "  |  " ..
+                               (target and target.Name or "none") ..
+                               "  |  " .. ping .. "ms"
+        StatusLbl.TextColor3 = col
+        task.wait(0.5)
+    end
+end)
+
+-- ─────────────────────────────────────────────────────────────
+--  SCROLL AREA  (settings cards)
+-- ─────────────────────────────────────────────────────────────
+local scrollTop = 64 + (isMobile and 70 or 60) + 8 + 28 + 8
+
+local Scroll = Instance.new("ScrollingFrame")
+Scroll.Size                  = UDim2.new(1, -20, 1, -(scrollTop + 10))
+Scroll.Position              = UDim2.fromOffset(10, scrollTop)
+Scroll.BackgroundTransparency = 1
+Scroll.BorderSizePixel       = 0
+Scroll.ScrollBarThickness    = 3
+Scroll.ScrollBarImageColor3  = C.accent
+Scroll.CanvasSize            = UDim2.fromOffset(0, 0)
+Scroll.AutomaticCanvasSize   = Enum.AutomaticSize.Y
+Scroll.Parent                = Main
+
+local List = Instance.new("UIListLayout")
+List.SortOrder = Enum.SortOrder.LayoutOrder
+List.Padding   = UDim.new(0, 8)
+List.Parent    = Scroll
+
+local Pad = Instance.new("UIPadding")
+Pad.PaddingTop    = UDim.new(0, 4)
+Pad.PaddingBottom = UDim.new(0, 8)
+Pad.PaddingLeft   = UDim.new(0, 2)
+Pad.PaddingRight  = UDim.new(0, 2)
+Pad.Parent        = Scroll
+
+-- ─────────────────────────────────────────────────────────────
+--  UI COMPONENT FACTORIES
+-- ─────────────────────────────────────────────────────────────
+
+-- ── section header ───────────────────────────────────────────
+local orderCounter = 0
+local function nextOrder()
+    orderCounter = orderCounter + 1
+    return orderCounter
+end
+
+local function mkSep(text)
+    local f = Instance.new("Frame")
+    f.LayoutOrder        = nextOrder()
+    f.Size               = UDim2.new(1, 0, 0, 20)
+    f.BackgroundTransparency = 1
+    f.Parent             = Scroll
+
+    local l = mkLabel(f, text, 10, C.sub, Enum.Font.GothamBold)
+    l.Size               = UDim2.new(0, 100, 1, 0)
+
+    local line = Instance.new("Frame")
+    line.Size            = UDim2.new(1, -108, 0, 1)
+    line.Position        = UDim2.new(0, 104, 0.5, 0)
+    line.BackgroundColor3 = C.accent
+    line.BackgroundTransparency = 0.72
+    line.BorderSizePixel = 0
+    line.Parent          = f
+end
+
+-- ── toggle row ───────────────────────────────────────────────
+local function mkToggle(title, sub, cfgKey, onColor)
+    local h   = isMobile and 62 or 54
+    onColor   = onColor or C.accent
+
+    local card = Instance.new("Frame")
+    card.LayoutOrder      = nextOrder()
+    card.Size             = UDim2.new(1, 0, 0, h)
+    card.BackgroundColor3 = C.card
+    card.BorderSizePixel  = 0
+    card.Parent           = Scroll
+    mkCorner(card, 12)
+    local cs = mkStroke(card, C.off, 1.5)
+
+    local tLbl = mkLabel(card, title, isMobile and 14 or 13, C.text, Enum.Font.GothamBold)
+    tLbl.Size     = UDim2.new(1, -90, 0, 20)
+    tLbl.Position = UDim2.fromOffset(12, h/2 - (sub~="" and 14 or 10))
+
+    if sub ~= "" then
+        local sLbl = mkLabel(card, sub, isMobile and 11 or 10, C.sub, Enum.Font.Gotham)
+        sLbl.Size     = UDim2.new(1, -90, 0, 14)
+        sLbl.Position = UDim2.fromOffset(12, h/2 + 2)
+    end
+
+    -- pill
+    local pill = Instance.new("Frame")
+    pill.Size             = UDim2.fromOffset(isMobile and 58 or 52, isMobile and 28 or 24)
+    pill.Position         = UDim2.new(1, -(isMobile and 68 or 62),
+                                       0.5, -(isMobile and 14 or 12))
+    pill.BackgroundColor3 = Config[cfgKey] and onColor or C.off
+    pill.BorderSizePixel  = 0
+    pill.Parent           = card
+    mkCorner(pill, isMobile and 14 or 12)
+
+    local knob = Instance.new("Frame")
+    local kSize = isMobile and 20 or 18
+    knob.Size             = UDim2.fromOffset(kSize, kSize)
+    knob.Position         = Config[cfgKey]
+        and UDim2.fromOffset((isMobile and 58 or 52) - kSize - 4, 4)
+        or  UDim2.fromOffset(4, 4)
+    knob.BackgroundColor3 = C.white
+    knob.BorderSizePixel  = 0
+    knob.Parent           = pill
+    mkCorner(knob, kSize/2)
+
+    local pillTxt = mkLabel(pill,
+        Config[cfgKey] and "ON" or "OFF",
+        9, C.white, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+    pillTxt.Size = UDim2.fromScale(1, 1)
+
+    local hit = Instance.new("TextButton")
+    hit.Size               = UDim2.fromScale(1, 1)
+    hit.BackgroundTransparency = 1
+    hit.Text               = ""
+    hit.ZIndex             = 5
+    hit.Parent             = card
+
+    local function refresh()
+        local on  = Config[cfgKey]
+        local kOff = (isMobile and 58 or 52) - kSize - 4
+        tw(pill,  {BackgroundColor3 = on and onColor or C.off}, 0.14)
+        tw(knob,  {Position = on
+            and UDim2.fromOffset(kOff, 4)
+            or  UDim2.fromOffset(4, 4)}, 0.14)
+        tw(cs,    {Color = on and onColor or C.off}, 0.14)
+        pillTxt.Text = on and "ON" or "OFF"
+    end
+
+    hit.MouseButton1Click:Connect(function()
+        Config[cfgKey] = not Config[cfgKey]
+        refresh()
+        -- side effect handlers
+        if cfgKey == "ProjVoidEnabled" then
+            if Config[cfgKey] and Config.Enabled then
+                startProjVoid()
+            elseif not Config[cfgKey] then
+                stopProjVoid()
+            end
+        end
+        if cfgKey == "JitterEnabled" or cfgKey == "SlingEnabled"
+           or cfgKey == "SlingPingScale" then
+            -- no extra action needed, value is read each cycle
+        end
+        -- icon bounce
+        tw(card, {BackgroundColor3 = Color3.fromRGB(30,34,58)}, 0.07)
+        task.delay(0.1, function()
+            tw(card, {BackgroundColor3 = C.card}, 0.12)
+        end)
+    end)
+
+    hit.MouseEnter:Connect(function()
+        tw(card, {BackgroundColor3 = Color3.fromRGB(28,32,56)}, 0.1)
+    end)
+    hit.MouseLeave:Connect(function()
+        tw(card, {BackgroundColor3 = C.card}, 0.1)
+    end)
+end
+
+-- ── slider row ───────────────────────────────────────────────
+local function mkSlider(title, cfgKey, min, max, decimals, suffix, fillColor)
+    local h = isMobile and 70 or 62
+    fillColor = fillColor or C.accent
+
+    local card = Instance.new("Frame")
+    card.LayoutOrder      = nextOrder()
+    card.Size             = UDim2.new(1, 0, 0, h)
+    card.BackgroundColor3 = C.card
+    card.BorderSizePixel  = 0
+    card.Parent           = Scroll
+    mkCorner(card, 12)
+    mkStroke(card, C.off, 1.5)
+
+    local fmt = decimals > 0
+        and ("%." .. decimals .. "f")
+        or  "%d"
+
+    local valLbl = mkLabel(card,
+        title .. "  " .. string.format(fmt, Config[cfgKey]) .. (suffix or ""),
+        isMobile and 13 or 12, C.text, Enum.Font.GothamBold)
+    valLbl.Size     = UDim2.new(1, -16, 0, 20)
+    valLbl.Position = UDim2.fromOffset(12, 10)
+
+    local trackBg = Instance.new("Frame")
+    trackBg.Size             = UDim2.new(1, -24, 0, isMobile and 12 or 10)
+    trackBg.Position         = UDim2.fromOffset(12, h - (isMobile and 24 or 22))
+    trackBg.BackgroundColor3 = C.off
+    trackBg.BorderSizePixel  = 0
+    trackBg.Parent           = card
+    mkCorner(trackBg, 5)
+
+    local pct  = (Config[cfgKey] - min) / (max - min)
+    local fill = Instance.new("Frame")
+    fill.Size             = UDim2.fromScale(math.clamp(pct, 0, 1), 1)
+    fill.BackgroundColor3 = fillColor
+    fill.BorderSizePixel  = 0
+    fill.Parent           = trackBg
+    mkCorner(fill, 5)
+
+    local dragging = false
+    local function updateVal(x)
+        local rel = math.clamp(
+            (x - trackBg.AbsolutePosition.X) / trackBg.AbsoluteSize.X,
+            0, 1
+        )
+        local raw = min + rel * (max - min)
+        local val = decimals > 0
+            and math.floor(raw * 10^decimals + 0.5) / 10^decimals
+            or  math.floor(raw + 0.5)
+        Config[cfgKey] = val
+        fill.Size      = UDim2.fromScale(rel, 1)
+        valLbl.Text    = title .. "  " .. string.format(fmt, val) .. (suffix or "")
+    end
+
+    local hitArea = Instance.new("TextButton")
+    hitArea.Size               = UDim2.new(1, 0, 1, isMobile and 20 or 14)
+    hitArea.Position           = UDim2.fromOffset(0, -(isMobile and 10 or 7))
+    hitArea.BackgroundTransparency = 1
+    hitArea.Text               = ""
+    hitArea.ZIndex             = 5
+    hitArea.Parent             = trackBg
+
+    -- PC mouse
+    hitArea.MouseButton1Down:Connect(function(x) dragging=true updateVal(x) end)
+    UserInputService.InputChanged:Connect(function(inp)
+        if dragging and inp.UserInputType == Enum.UserInputType.MouseMovement then
+            updateVal(inp.Position.X)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+        end
+    end)
+
+    -- Mobile touch
+    hitArea.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            updateVal(inp.Position.X)
+        end
+    end)
+    hitArea.InputChanged:Connect(function(inp)
+        if dragging and inp.UserInputType == Enum.UserInputType.Touch then
+            updateVal(inp.Position.X)
+        end
+    end)
+    hitArea.InputEnded:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+end
+
+-- ── dropdown row ─────────────────────────────────────────────
+local function mkDropdown(title, cfgKey, options, fillColor)
+    fillColor = fillColor or C.accent
+    local h   = isMobile and 58 or 50
+
+    local card = Instance.new("Frame")
+    card.LayoutOrder      = nextOrder()
+    card.Size             = UDim2.new(1, 0, 0, h)
+    card.BackgroundColor3 = C.card
+    card.BorderSizePixel  = 0
+    card.ClipsDescendants = false
+    card.Parent           = Scroll
+    mkCorner(card, 12)
+    mkStroke(card, C.off, 1.5)
+
+    local tLbl = mkLabel(card, title, isMobile and 13 or 12, C.sub, Enum.Font.GothamSemibold)
+    tLbl.Size     = UDim2.new(0.45, 0, 1, 0)
+    tLbl.Position = UDim2.fromOffset(12, 0)
+
+    local valBtn = Instance.new("TextButton")
+    valBtn.Size             = UDim2.new(0.5, 0, 0, h - 16)
+    valBtn.Position         = UDim2.new(0.48, 0, 0.5, -(h-16)/2)
+    valBtn.BackgroundColor3 = C.surface
+    valBtn.TextColor3       = C.white
+    valBtn.Font             = Enum.Font.GothamBold
+    valBtn.TextSize         = isMobile and 13 or 12
+    valBtn.Text             = Config[cfgKey] .. " ▾"
+    valBtn.BorderSizePixel  = 0
+    valBtn.ZIndex           = 2
+    valBtn.Parent           = card
+    mkCorner(valBtn, 8)
+
+    local dropFrame = Instance.new("Frame")
+    dropFrame.Size             = UDim2.new(0.5, 0, 0, #options * (isMobile and 40 or 34))
+    dropFrame.Position         = UDim2.new(0.48, 0, 1, 4)
+    dropFrame.BackgroundColor3 = C.surface
+    dropFrame.BorderSizePixel  = 0
+    dropFrame.Visible          = false
+    dropFrame.ZIndex           = 20
+    dropFrame.Parent           = card
+    mkCorner(dropFrame, 8)
+    mkStroke(dropFrame, fillColor, 1.5)
+
+    local dList = Instance.new("UIListLayout")
+    dList.SortOrder = Enum.SortOrder.LayoutOrder
+    dList.Parent    = dropFrame
+
+    for i, opt in ipairs(options) do
+        local ob = Instance.new("TextButton")
+        ob.LayoutOrder      = i
+        ob.Size             = UDim2.new(1, 0, 0, isMobile and 40 or 34)
+        ob.BackgroundColor3 = Config[cfgKey] == opt and fillColor or C.surface
+        ob.TextColor3       = C.white
+        ob.Font             = Enum.Font.GothamSemibold
+        ob.TextSize         = isMobile and 13 or 12
+        ob.Text             = opt
+        ob.BorderSizePixel  = 0
+        ob.ZIndex           = 21
+        ob.Parent           = dropFrame
+        if i == 1 then mkCorner(ob, 8) end
+
+        ob.MouseButton1Click:Connect(function()
+            Config[cfgKey] = opt
+            valBtn.Text    = opt .. " ▾"
+            dropFrame.Visible = false
+            -- colour all options
+            for _, c in ipairs(dropFrame:GetChildren()) do
+                if c:IsA("TextButton") then
+                    c.BackgroundColor3 = c.Text == opt and fillColor or C.surface
+                end
+            end
+            nearestCache = nil  -- reset nearest cache on target change
+        end)
+    end
+
+    local open = false
+    valBtn.MouseButton1Click:Connect(function()
+        open = not open
+        dropFrame.Visible = open
+    end)
+
+    -- close when clicking elsewhere
+    UserInputService.InputBegan:Connect(function(inp)
+        if open and (inp.UserInputType == Enum.UserInputType.MouseButton1
+                  or inp.UserInputType == Enum.UserInputType.Touch) then
+            task.defer(function()
+                if dropFrame.Visible then
+                    dropFrame.Visible = false
+                    open = false
+                end
+            end)
+        end
+    end)
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  BUILD UI SECTIONS
+-- ─────────────────────────────────────────────────────────────
+
+mkSep("TARGET")
+mkDropdown("Target Mode", "TargetMode", {"Closest","LowestHP","HighestHP"}, C.blue)
+
+mkSep("VOID SPAM TIMING")
+mkSlider("Hide Time",    "HideTime",    0.05, 0.6,  2, "s",  C.accent)
+mkSlider("Attack Time",  "AttackTime",  0.03, 0.4,  2, "s",  C.accent)
+mkSlider("Return Delay", "ReturnDelay", 0.02, 0.3,  2, "s",  C.sub)
+mkSlider("Hide Y",       "HideY",       -2000,-100, 0, " Y", C.purple)
+
+mkSep("SLINGSHOT BYPASS")
+mkToggle("Sling Fire",      "Auto-fires on snap",              "SlingEnabled",    C.accent)
+mkToggle("Ping Scale",      "Adjusts timing by ping (HvH rec)","SlingPingScale",  C.blue)
+mkSlider("Shots / Cycle",   "SlingShots",  1, 5, 0, "",   C.warn)
+mkSlider("Shot Delay",      "SlingDelay",  0, 0.15, 2, "s", C.warn)
+
+mkSep("PROJECTILE VOID")
+mkToggle("Void CoreProjectile", "Teleports enemy shots to void", "ProjVoidEnabled", C.red)
+
+mkSep("ANTI-DETECTION")
+mkToggle("Position Jitter", "Randomises hide position slightly","JitterEnabled",   C.purple)
+mkSlider("Jitter Range",    "JitterRange", 0, 10, 0, " studs", C.purple)
+
+-- ─────────────────────────────────────────────────────────────
+--  PRESET BUTTONS ROW
+-- ─────────────────────────────────────────────────────────────
+mkSep("PRESETS")
+
+local presetRow = Instance.new("Frame")
+presetRow.LayoutOrder      = nextOrder()
+presetRow.Size             = UDim2.new(1, 0, 0, isMobile and 50 or 42)
+presetRow.BackgroundTransparency = 1
+presetRow.Parent           = Scroll
+
+local presetList = Instance.new("UIListLayout")
+presetList.FillDirection   = Enum.FillDirection.Horizontal
+presetList.SortOrder       = Enum.SortOrder.LayoutOrder
+presetList.Padding         = UDim.new(0, 6)
+presetList.Parent          = presetRow
+
+local function mkPreset(label, fn, color)
+    local b = mkBtn(presetRow, label, isMobile and 12 or 11, color, C.white)
+    b.LayoutOrder  = nextOrder()
+    b.Size         = UDim2.new(0.31, -4, 1, 0)
+    b.MouseButton1Click:Connect(fn)
+end
+
+-- SAFE preset — good for low ping, cautious
+mkPreset("SAFE", function()
+    Config.HideTime       = 0.28
+    Config.AttackTime     = 0.12
+    Config.ReturnDelay    = 0.08
+    Config.SlingShots     = 1
+    Config.SlingDelay     = 0.05
+    Config.JitterEnabled  = true
+    Config.JitterRange    = 5
+    Config.SlingPingScale = true
+end, C.accentD)
+
+-- RAGE preset — maximum aggression
+mkPreset("RAGE", function()
+    Config.HideTime       = 0.10
+    Config.AttackTime     = 0.06
+    Config.ReturnDelay    = 0.03
+    Config.SlingShots     = 3
+    Config.SlingDelay     = 0.03
+    Config.JitterEnabled  = false
+    Config.JitterRange    = 0
+    Config.SlingPingScale = false
+end, C.red)
+
+-- HIGH PING preset — tuned for 150ms+
+mkPreset("HIGH PING", function()
+    Config.HideTime       = 0.15
+    Config.AttackTime     = 0.20
+    Config.ReturnDelay    = 0.05
+    Config.SlingShots     = 2
+    Config.SlingDelay     = 0.04
+    Config.JitterEnabled  = true
+    Config.JitterRange    = 3
+    Config.SlingPingScale = true
+end, C.warn)
+
+-- ─────────────────────────────────────────────────────────────
+--  OPEN ANIMATION
+-- ─────────────────────────────────────────────────────────────
+tw(Main,
+    {Size = UDim2.fromOffset(WIN_W, WIN_H)},
+    0.28, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+
+-- ─────────────────────────────────────────────────────────────
+--  DONE
+-- ─────────────────────────────────────────────────────────────
+print("[VoidSpam] loaded for " .. LP.Name)
+print("[VoidSpam] Mobile: " .. tostring(isMobile))
+print("[VoidSpam] Ping:   " .. math.floor(getPing()) .. "ms")
